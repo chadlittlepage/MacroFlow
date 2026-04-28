@@ -8,3 +8,17 @@ pyproject.toml.bak
 .coverage
 .pytest_cache/
 .ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+*.dmg
+*.pkg
+*.zip
+
+# notarization & signing scratch
+notarization-*.zip
+*.notarization.log
+
+# local-only overrides
+.env
+.env.local

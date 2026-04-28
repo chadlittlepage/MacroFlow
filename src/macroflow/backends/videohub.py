@@ -18,12 +18,28 @@ from __future__ import annotations
 
 import json
 import socket
-import threading
+import threading as _threading
 from dataclasses import dataclass
 from pathlib import Path
 
 VIDEOHUB_PORT = 9990
 VIDEOHUB_CONFIG = Path("/Users/Shared/Videohub Controller/videohub_controller.json")
+
+# Test mode: when True, recall_preset() does not touch the network — it logs
+# what it would have sent and returns True. Useful for exercising the macro
+# UI without a Videohub on the LAN.
+MOCK_MODE: bool = False
+
+# After every recall_preset() call, this is updated with a record of what
+# was just applied so the GUI can display it. {device_id, preset_name,
+# routes: [(out, in), ...], endpoint: "..." | "(mock)" | None}
+LAST_RECALL: dict = {}
+
+
+def set_mock_mode(enabled: bool) -> None:
+    global MOCK_MODE
+    MOCK_MODE = bool(enabled)
+    print(f"[videohub] MOCK_MODE = {MOCK_MODE}")
 
 
 @dataclass
@@ -80,22 +96,157 @@ def get_preset(device_id: str, preset_name: str) -> dict | None:
     return dev.get("presets", {}).get(preset_name)
 
 
-def recall_preset(device_id: str, preset_name: str, timeout: float = 3.0) -> bool:
-    """Open a TCP connection to the device's IP and apply the preset routing.
+def _candidate_ips(device_id: str, dev: dict, cfg: dict) -> list[str]:
+    """Endpoints to try, in priority order:
+       1. The device's stored IP.
+       2. cfg['last_ip'] if it matches this device_id and differs from above
+          (Videohub Controller updates this when it discovers a new IP).
+       3. 127.0.0.1 — the local BlackmagicVideohubDaemon, which Videohub
+          Controller talks to even when no real hardware is connected.
+          Sending routing to the daemon updates the GUI in real time.
+    """
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for ip in (
+        dev.get("ip", ""),
+        cfg.get("last_ip", "") if cfg.get("last_device_id") == device_id else "",
+        "127.0.0.1",
+    ):
+        if ip and ip not in seen:
+            seen.add(ip)
+            ordered.append(ip)
+    return ordered
 
-    Returns True on success, False on any failure (no device, no IP, no preset,
-    socket error, etc.). Errors are logged to stdout, not raised — MacroFlow
-    fires multiple actions in parallel and one backend failure should not stop
-    the others.
+
+def _try_send(ip: str, payload: bytes, timeout: float) -> bool:
+    try:
+        with socket.create_connection((ip, VIDEOHUB_PORT), timeout=timeout) as sock:
+            sock.sendall(payload)
+            return True
+    except OSError as e:
+        print(f"[videohub]   {ip}: {e}")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Cross-process API to Videohub Controller via NSDistributedNotificationCenter.
+# When VHC is running, this is the preferred path: it drives VHC's own recall
+# logic, so VHC's matrix/LCD update in real time and there's no protocol
+# divergence. Falls back to raw TCP if VHC doesn't reply within a timeout.
+# ---------------------------------------------------------------------------
+
+NOTIF_RECALL = "MacroFlowRecallPreset"
+NOTIF_RECALL_RESULT = "MacroFlowRecallPresetResult"
+
+# A singleton bridge holds the NSDistributedNotificationCenter observer.
+# It must be created on the main thread so its callback fires via the main
+# runloop; PyObjC observers registered on a worker thread never receive
+# callbacks (no runloop). All worker threads then signal/wait via the
+# shared _PENDING dict.
+
+_BRIDGE = None
+_PENDING_LOCK = _threading.Lock()
+_PENDING: dict = {}  # request_id -> {"event": Event, "result": (ok, msg)}
+
+
+def _ensure_bridge_class():
+    """Lazily define the bridge class so module import doesn't pull in AppKit
+    when the videohub backend is imported in a non-GUI context."""
+    global _BridgeClass
+    if "_BridgeClass" in globals():
+        return _BridgeClass
+    from Foundation import NSObject
+
+    class _BridgeClass(NSObject):  # noqa: F811
+        def handleResult_(self, note):  # NOQA: N802
+            info = note.userInfo() or {}
+            rid = str(info.get("request_id") or "")
+            with _PENDING_LOCK:
+                slot = _PENDING.get(rid)
+            if slot is None:
+                return
+            slot["result"] = (
+                str(info.get("ok") or "") == "1",
+                str(info.get("message") or ""),
+            )
+            slot["event"].set()
+
+    globals()["_BridgeClass"] = _BridgeClass
+    return _BridgeClass
+
+
+def init_bridge() -> None:
+    """Create the singleton observer. MUST be called on the main thread,
+    before any worker thread tries to use _try_recall_via_vhc()."""
+    global _BRIDGE
+    if _BRIDGE is not None:
+        return
+    try:
+        from AppKit import NSDistributedNotificationCenter
+    except ImportError:
+        print("[videohub] AppKit not available; VHC API disabled")
+        return
+    cls = _ensure_bridge_class()
+    _BRIDGE = cls.alloc().init()
+    center = NSDistributedNotificationCenter.defaultCenter()
+    center.addObserver_selector_name_object_(
+        _BRIDGE, "handleResult:", NOTIF_RECALL_RESULT, None,
+    )
+    print("[videohub] VHC notification bridge ready")
+
+
+def _try_recall_via_vhc(device_id: str, preset_name: str,
+                         timeout: float = 1.5) -> tuple[bool, str]:
+    """Post a recall request to Videohub Controller and wait for its ack.
+
+    Returns (succeeded, info). If VHC isn't running or doesn't reply within
+    the timeout, returns (False, "no reply") so the caller can fall back.
+    """
+    if _BRIDGE is None:
+        return False, "bridge not initialised"
+    try:
+        from AppKit import NSDistributedNotificationCenter
+    except ImportError:
+        return False, "AppKit unavailable"
+    import uuid
+
+    request_id = str(uuid.uuid4())
+    event = _threading.Event()
+    result: tuple[bool, str] = (False, "no reply")
+    slot: dict = {"event": event, "result": result}
+    with _PENDING_LOCK:
+        _PENDING[request_id] = slot
+    try:
+        center = NSDistributedNotificationCenter.defaultCenter()
+        center.postNotificationName_object_userInfo_deliverImmediately_(
+            NOTIF_RECALL,
+            None,
+            {"device_id": device_id,
+             "preset_name": preset_name,
+             "request_id": request_id},
+            True,
+        )
+        event.wait(timeout=timeout)
+    finally:
+        with _PENDING_LOCK:
+            _PENDING.pop(request_id, None)
+    final = slot["result"]
+    if isinstance(final, tuple) and len(final) == 2:
+        return bool(final[0]), str(final[1])
+    return False, "invalid result"
+
+
+def recall_preset(device_id: str, preset_name: str, timeout: float = 2.0) -> bool:
+    """Open a TCP connection to a Videohub endpoint and apply the preset routing.
+
+    Tries multiple endpoints in order — the device's saved IP, the top-level
+    last_ip (if it matches), and finally the local Videohub Daemon at
+    127.0.0.1. Returns True on the first successful send.
     """
     cfg = load_config()
     dev = cfg.get("devices", {}).get(device_id)
     if not dev:
         print(f"[videohub] Unknown device {device_id}")
-        return False
-    ip = dev.get("ip", "")
-    if not ip:
-        print(f"[videohub] Device {device_id} has no IP")
         return False
     preset = dev.get("presets", {}).get(preset_name)
     if not preset:
@@ -106,28 +257,62 @@ def recall_preset(device_id: str, preset_name: str, timeout: float = 3.0) -> boo
         print(f"[videohub] Preset '{preset_name}' has no routing")
         return False
 
-    # Build the Videohub video output routing block. Indices are 0-based on
-    # the wire; routing[output_idx] = input_idx, with -1 meaning "skip".
+    # Build the Videohub video output routing block. Indices are 0-based;
+    # routing[output_idx] = input_idx, with -1 meaning "skip".
     lines = ["VIDEO OUTPUT ROUTING:"]
     for output_idx, input_idx in enumerate(routing):
         if input_idx is None or input_idx < 0:
             continue
         lines.append(f"{output_idx} {input_idx}")
     payload = ("\n".join(lines) + "\n\n").encode("utf-8")
+    n_routes = len(lines) - 1
+    label = dev.get("friendly_name") or dev.get("model_name") or device_id
 
-    try:
-        with socket.create_connection((ip, VIDEOHUB_PORT), timeout=timeout) as sock:
-            sock.sendall(payload)
+    routes = [
+        (out_idx, in_idx)
+        for out_idx, in_idx in enumerate(routing)
+        if in_idx is not None and in_idx >= 0
+    ]
+
+    def _record(endpoint: str | None, ok: bool) -> None:
+        global LAST_RECALL
+        LAST_RECALL = {
+            "device_id": device_id,
+            "device_label": label,
+            "preset_name": preset_name,
+            "routes": routes,
+            "endpoint": endpoint,
+            "ok": ok,
+        }
+
+    if MOCK_MODE:
+        print(f"[videohub MOCK] would recall '{preset_name}' on {label}: "
+              f"{n_routes} route(s)")
+        _record("(mock)", True)
+        return True
+
+    # Preferred path: ask Videohub Controller via NSDistributedNotificationCenter.
+    # VHC drives its own recall, so its matrix/LCD update in real time.
+    ok, msg = _try_recall_via_vhc(device_id, preset_name)
+    if ok:
+        print(f"[videohub] recall OK via VHC API ({msg})")
+        _record("vhc-api", True)
+        return True
+    if msg and msg != "no reply":
+        # VHC was reachable but rejected the request (preset/device mismatch).
+        print(f"[videohub] VHC API rejected: {msg}")
+
+    # Fallback: raw TCP to known endpoints (works without VHC running).
+    candidates = _candidate_ips(device_id, dev, cfg)
+    print(f"[videohub] falling back to TCP for '{preset_name}' on {label} "
+          f"({n_routes} routes); trying {candidates}")
+    for ip in candidates:
+        if _try_send(ip, payload, timeout):
+            print(f"[videohub] recall OK via {ip}")
+            _record(ip, True)
             return True
-    except OSError as e:
-        print(f"[videohub] Failed to recall '{preset_name}' on {ip}: {e}")
-        return False
+    print("[videohub] recall FAILED — no endpoint accepted the payload")
+    _record(None, False)
+    return False
 
 
-def recall_preset_async(device_id: str, preset_name: str) -> threading.Thread:
-    """Fire-and-forget recall on a background thread."""
-    t = threading.Thread(
-        target=recall_preset, args=(device_id, preset_name), daemon=True,
-    )
-    t.start()
-    return t

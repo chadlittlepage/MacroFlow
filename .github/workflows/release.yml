@@ -1,0 +1,105 @@
+name: Release
+
+# Tag-driven: pushing a version tag (v0.1.0, v1.2.3, …) triggers
+# a signed + notarized .dmg build and attaches it to the GitHub Release.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write  # needed to create GitHub Releases
+
+jobs:
+  build-sign-notarize:
+    name: Build, sign, notarize, release
+    runs-on: macos-14
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install build deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install py2app dmgbuild
+          pip install pyobjc-core pyobjc-framework-Cocoa pyobjc-framework-Quartz
+
+      # ── Code-signing identity ──────────────────────────────────────────
+      # Imports the Developer ID Application cert from secrets into a
+      # temporary keychain so codesign can find it without the developer's
+      # login keychain. Cert + password come from the repo's GitHub secrets.
+      - name: Import Developer ID cert into temp keychain
+        env:
+          DEVELOPER_ID_CERT_BASE64: ${{ secrets.DEVELOPER_ID_CERT_BASE64 }}
+          DEVELOPER_ID_CERT_PASSWORD: ${{ secrets.DEVELOPER_ID_CERT_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          echo "$DEVELOPER_ID_CERT_BASE64" | base64 --decode > /tmp/cert.p12
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security set-keychain-settings -t 3600 -l build.keychain
+          security import /tmp/cert.p12 \
+              -k build.keychain \
+              -P "$DEVELOPER_ID_CERT_PASSWORD" \
+              -T /usr/bin/codesign
+          security set-key-partition-list \
+              -S apple-tool:,apple:,codesign: \
+              -s -k "$KEYCHAIN_PASSWORD" build.keychain
+          rm /tmp/cert.p12
+
+      # ── App Store Connect API key for notarytool ───────────────────────
+      # Modern Apple notarization uses an API key (.p8) — revocable per-key,
+      # safer than an account password. Stored as a base64 secret.
+      - name: Stage notary API key
+        env:
+          NOTARY_API_KEY_BASE64: ${{ secrets.NOTARY_API_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.private_keys
+          echo "$NOTARY_API_KEY_BASE64" | base64 --decode \
+              > ~/.private_keys/notary_key.p8
+
+      # ── Build, sign, notarize, DMG ─────────────────────────────────────
+      - name: Build + sign + notarize + DMG
+        env:
+          DEVELOPER_ID_NAME: ${{ secrets.DEVELOPER_ID_NAME }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          chmod +x build_and_sign.sh
+          ./build_and_sign.sh \
+              --identity "$DEVELOPER_ID_NAME" \
+              --notary-key ~/.private_keys/notary_key.p8 \
+              --notary-key-id "$NOTARY_KEY_ID" \
+              --notary-issuer "$NOTARY_ISSUER_ID"
+
+      - name: Show release artifacts
+        run: ls -lh dist/
+
+      # ── GitHub Release ─────────────────────────────────────────────────
+      - name: Create GitHub Release and upload .dmg
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.dmg
+
+      # ── Cleanup ────────────────────────────────────────────────────────
+      - name: Wipe keychain + notary key
+        if: always()
+        run: |
+          security delete-keychain build.keychain 2>/dev/null || true
+          rm -f ~/.private_keys/notary_key.p8

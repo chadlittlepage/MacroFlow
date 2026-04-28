@@ -7,6 +7,12 @@ that can simultaneously:
 - Enable/disable specific DaVinci Resolve video tracks
 - (Round 2) Trigger automatically when Resolve hits a programmed timecode
 
+> **License notice.** MacroFlow is **source-available**, not open source.
+> The code is published for transparency and bug reporting. You may read,
+> clone, and run it locally for personal evaluation. Redistribution,
+> modification, derivative works, or commercial use require prior written
+> permission. See [LICENSE](LICENSE) for the exact terms.
+
 ## Status
 
 **Round 1 (manual macro grid) — in progress.**
@@ -84,4 +90,5 @@ chad.littlepage@gmail.com
 
 ## License
 
-MIT
+Source-Available, all rights reserved. Read [LICENSE](LICENSE) before
+forking, redistributing, or using in any commercial product.

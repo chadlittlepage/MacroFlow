@@ -1,0 +1,44 @@
+MacroFlow — Source-Available License
+Copyright (c) 2026 Chad Littlepage. All rights reserved.
+
+This source code and accompanying materials (the "Software") are made
+publicly viewable for purposes of transparency, portfolio review, bug
+reporting, and academic study. Publication on a public source-code host
+does NOT constitute a grant of any rights beyond those expressly stated
+below.
+
+PERMITTED, WITHOUT FURTHER PERMISSION
+   1. You may view, read, and clone this repository.
+   2. You may build the Software locally on a machine you own and run it
+      privately for your own personal evaluation.
+   3. You may submit issues, pull requests, and suggested patches. By
+      submitting a contribution you grant the copyright holder a
+      perpetual, worldwide, royalty-free license to incorporate it into
+      the Software under any license the copyright holder chooses.
+
+NOT PERMITTED WITHOUT PRIOR WRITTEN PERMISSION
+   1. Copying, modifying, or creating derivative works for any purpose
+      other than the personal evaluation described above.
+   2. Redistributing the Software in source or binary form, in whole or
+      in part, including (without limitation) compiled .app bundles,
+      .dmg installers, .pkg installers, or repackaged forks.
+   3. Use of the Software, in source or binary form, in any commercial
+      product, paid service, or revenue-generating workflow.
+   4. Removing or obscuring this notice, the author attribution, or any
+      copyright headers in source files.
+   5. Use of the names "MacroFlow" or "Chad Littlepage" to endorse or
+      promote derivative works.
+
+To request a license for any of the above, contact:
+   Chad Littlepage  —  chad.littlepage@gmail.com
+
+NO WARRANTY
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING
+FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+All rights not expressly granted are reserved.
