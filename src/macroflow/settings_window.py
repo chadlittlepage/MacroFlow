@@ -103,6 +103,19 @@ class _SettingsController(NSObject):
         rows, cols = GRID_CHOICES[idx]
         self.controller.apply_grid_size(rows, cols)
 
+    def timelineResolutionChanged_(self, sender):  # NOQA: N802
+        keys = getattr(self, "_tl_choice_keys", None) or ["auto"]
+        idx = int(sender.indexOfSelectedItem())
+        if idx < 0 or idx >= len(keys):
+            return
+        new_value = keys[idx]
+        self.controller._store.grid.timeline_resolution = new_value
+        try:
+            self.controller._store.save()
+        except Exception as e:
+            print(f"[settings] save after timeline-res change failed: {e}")
+        print(f"[settings] timeline_resolution = {new_value}")
+
     def videohubToggled_(self, sender):  # NOQA: N802
         on = bool(int(sender.state()) == 1)
         self.controller.set_videohub_enabled(on)
@@ -179,7 +192,7 @@ def show_settings_window(controller) -> None:
     sc = _SettingsController.alloc().init()
     sc.attach(controller)
 
-    win_w, win_h = 360, 500
+    win_w, win_h = 360, 540
     style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
     window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
         NSMakeRect(0, 0, win_w, win_h), style, NSBackingStoreBuffered, False,
@@ -266,10 +279,52 @@ def show_settings_window(controller) -> None:
     content.addSubview_(grid_popup)
     sc.grid_popup = grid_popup
 
+    # Timeline resolution override — quadrant offsets snap to ±tl_w/2,
+    # ±tl_h/2. When Resolve's GetSetting returns empty (compound clips,
+    # nested timelines, some Resolve 20.1 / macOS 15 builds), the editor
+    # falls back to (1920, 1080) and the offsets come out wrong. This
+    # popup lets the user pin the value explicitly.
+    tl_row_y = grid_row_y - 40
+    tl_label = NSTextField.alloc().initWithFrame_(
+        NSMakeRect(20, tl_row_y + 4, 110, 18),
+    )
+    tl_label.setStringValue_("Timeline:")
+    tl_label.setBezeled_(False)
+    tl_label.setDrawsBackground_(False)
+    tl_label.setEditable_(False)
+    tl_label.setSelectable_(False)
+    tl_label.setFont_(NSFont.boldSystemFontOfSize_(12))
+    tl_label.setTextColor_(
+        NSColor.colorWithCalibratedRed_green_blue_alpha_(*TEXT_BRIGHT),
+    )
+    content.addSubview_(tl_label)
+
+    tl_popup = NSPopUpButton.alloc().initWithFrame_(
+        NSMakeRect(120, tl_row_y, win_w - 140, 26),
+    )
+    TL_CHOICES = [
+        ("auto", "Auto-detect (read from Resolve)"),
+        ("1920x1080", "1920 × 1080  (HD)"),
+        ("3840x2160", "3840 × 2160  (4K)"),
+        ("7680x4320", "7680 × 4320  (8K)"),
+    ]
+    for _, label in TL_CHOICES:
+        tl_popup.addItemWithTitle_(label)
+    current_tl = getattr(grid, "timeline_resolution", "auto") or "auto"
+    tl_keys = [k for k, _ in TL_CHOICES]
+    tl_popup.selectItemAtIndex_(
+        tl_keys.index(current_tl) if current_tl in tl_keys else 0,
+    )
+    tl_popup.setTarget_(sc)
+    tl_popup.setAction_("timelineResolutionChanged:")
+    content.addSubview_(tl_popup)
+    sc.tl_popup = tl_popup
+    sc._tl_choice_keys = tl_keys
+
     # Videohub master switch — when off, the app runs without any Videohub
     # assumptions (no status probe, no recall on macro fire, no editor
     # device list).
-    vh_y = grid_row_y - 40
+    vh_y = tl_row_y - 40
     vh_check = NSButton.alloc().initWithFrame_(
         NSMakeRect(20, vh_y, win_w - 40, 22),
     )

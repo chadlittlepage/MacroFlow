@@ -236,6 +236,12 @@ class MacroGrid:
     display_font_size: float = 12.0   # LCD strip
     title_font_size: float = 13.0     # cell title
     hotkey_font_size: float = 26.0    # big hotkey glyph
+    # Timeline-resolution override for the macro editor's quadrant math.
+    # "auto" reads from Resolve (recommended); explicit values pin the
+    # quadrant offsets when Resolve's API returns empty/wrong on certain
+    # compound-clip / nested-timeline projects.
+    # Valid values: "auto" | "1920x1080" | "3840x2160" | "7680x4320"
+    timeline_resolution: str = "auto"
 
     @staticmethod
     def cell_id(row: int, col: int) -> str:
@@ -292,6 +298,9 @@ class MacroStore:
         self.grid.display_font_size = float(fs.get("display", 12.0))
         self.grid.title_font_size = float(fs.get("title", 13.0))
         self.grid.hotkey_font_size = float(fs.get("hotkey", 26.0))
+        self.grid.timeline_resolution = str(
+            data.get("timeline_resolution", "auto"),
+        )
         self.grid.macros = {
             mid: Macro.from_dict(m) for mid, m in (data.get("macros") or {}).items()
         }
@@ -316,6 +325,7 @@ class MacroStore:
                 "title": self.grid.title_font_size,
                 "hotkey": self.grid.hotkey_font_size,
             },
+            "timeline_resolution": self.grid.timeline_resolution,
             "macros": {mid: m.to_dict() for mid, m in self.grid.macros.items()},
             "presets": dict(self.grid.presets),
         }

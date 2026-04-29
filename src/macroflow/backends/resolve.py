@@ -504,16 +504,70 @@ def apply_video_track_transforms(transforms: dict[int, dict]) -> bool:
 
 def get_timeline_resolution() -> tuple[int, int]:
     """Return (width, height) of the current timeline. Falls back to 1920×1080
-    if no timeline / setting is queryable."""
-    tl = _current_timeline()
-    if tl is None:
+    if no timeline / setting is queryable.
+
+    Tries multiple sources in priority order:
+    1. Timeline-level GetSetting (most accurate when it works)
+    2. Project-level GetSetting (sometimes the only one populated, esp. when
+       the user is parked inside a compound clip whose nested timeline
+       returns empty resolution settings)
+    3. (1920, 1080) default — with a LOUD warning so the user knows the
+       quadrant offsets in the editor are about to be wrong.
+    """
+    if not connect():
+        print(
+            "[resolve] WARNING: could not connect — using fallback "
+            "(1920, 1080); quadrant offsets will be wrong if your "
+            "timeline is not HD"
+        )
         return (1920, 1080)
+    pm = project = tl = None
     try:
-        w = int(tl.GetSetting("timelineResolutionWidth") or 1920)
-        h = int(tl.GetSetting("timelineResolutionHeight") or 1080)
-        return (w, h)
-    except Exception:
+        # Source 1: timeline.GetSetting
+        tl = _current_timeline()
+        if tl is not None:
+            try:
+                w_raw = tl.GetSetting("timelineResolutionWidth")
+                h_raw = tl.GetSetting("timelineResolutionHeight")
+                w = int(w_raw) if w_raw not in (None, "", "0") else 0
+                h = int(h_raw) if h_raw not in (None, "", "0") else 0
+                if w > 0 and h > 0:
+                    return (w, h)
+            except (TypeError, ValueError, Exception):
+                pass
+
+        # Source 2: project.GetSetting — falls through to here when the
+        # timeline-level call returned empty, which happens with compound
+        # clips and some nested-timeline edge cases.
+        try:
+            pm = _resolve.GetProjectManager()
+            project = pm.GetCurrentProject() if pm else None
+        except Exception:
+            project = None
+        if project is not None:
+            try:
+                w_raw = project.GetSetting("timelineResolutionWidth")
+                h_raw = project.GetSetting("timelineResolutionHeight")
+                w = int(w_raw) if w_raw not in (None, "", "0") else 0
+                h = int(h_raw) if h_raw not in (None, "", "0") else 0
+                if w > 0 and h > 0:
+                    print(
+                        f"[resolve] timeline resolution from project: "
+                        f"{w}x{h} (timeline-level was empty)"
+                    )
+                    return (w, h)
+            except (TypeError, ValueError, Exception):
+                pass
+
+        print(
+            "[resolve] WARNING: timeline + project resolution settings "
+            "both empty — falling back to (1920, 1080). Open Resolve → "
+            "Project Settings → Master Settings to verify, or pin the "
+            "value in MacroFlow → Settings → Timeline resolution."
+        )
         return (1920, 1080)
+    finally:
+        del pm, project, tl
 
 
 def get_current_timecode() -> str | None:

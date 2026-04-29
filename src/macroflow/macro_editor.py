@@ -908,11 +908,32 @@ class MacroEditorWindow(NSWindow):
                 resolve.safe_get_video_track_transforms() or {}
             )
         # Refresh timeline resolution so quadrant offsets snap to the right
-        # values for whichever timeline is open.
-        try:
-            self._tl_w, self._tl_h = resolve.safe_get_timeline_resolution()
-        except Exception:
-            pass
+        # values for whichever timeline is open. Honors the user-configured
+        # override (Settings → Timeline resolution) when not "auto"; this
+        # is the workaround for projects where Resolve's GetSetting returns
+        # empty (compound clips, nested timelines, certain Resolve 20.1 +
+        # macOS 15 builds).
+        override = getattr(self._store.grid, "timeline_resolution", "auto")
+        if override and override != "auto" and "x" in override:
+            try:
+                w_str, h_str = override.split("x", 1)
+                self._tl_w = int(w_str)
+                self._tl_h = int(h_str)
+                print(
+                    f"[editor] timeline resolution pinned by user: "
+                    f"{self._tl_w}x{self._tl_h}"
+                )
+            except (TypeError, ValueError):
+                # Malformed override falls through to auto-detect.
+                try:
+                    self._tl_w, self._tl_h = resolve.safe_get_timeline_resolution()
+                except Exception:
+                    pass
+        else:
+            try:
+                self._tl_w, self._tl_h = resolve.safe_get_timeline_resolution()
+            except Exception:
+                pass
         live = self._cached_tracks
         live_xforms = self._cached_track_transforms
         seen: set[int] = set()
