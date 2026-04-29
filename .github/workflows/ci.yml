@@ -32,7 +32,7 @@ jobs:
           pip install ruff mypy
           pip install pyobjc-core pyobjc-framework-Cocoa pyobjc-framework-Quartz
 
-      - name: Ruff
+      - name: Ruff lint
         run: ruff check src/
 
       - name: Mypy
@@ -51,12 +51,24 @@ jobs:
           print('all modules import cleanly')
           "
 
-      - name: Pytest
+      - name: Pytest with coverage
         env:
           PYTHONPATH: src
         run: |
-          pip install pytest
-          pytest tests/ -q
+          pip install pytest pytest-cov
+          pytest tests/ -q \
+            --cov=macroflow \
+            --cov-report=xml \
+            --cov-report=term
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./coverage.xml
+          flags: unittests
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
   build-dry-run:
     name: py2app dry build

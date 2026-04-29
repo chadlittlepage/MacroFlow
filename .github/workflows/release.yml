@@ -96,6 +96,7 @@ jobs:
           fail_on_unmatched_files: true
           files: |
             dist/*.dmg
+            dist/*.dmg.sha256
 
       # ── Cleanup ────────────────────────────────────────────────────────
       - name: Wipe keychain + notary key

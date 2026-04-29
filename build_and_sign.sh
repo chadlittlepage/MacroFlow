@@ -157,8 +157,15 @@ echo "==> Stapling DMG..."
 xcrun stapler staple "${DMG_PATH}"
 xcrun stapler validate "${DMG_PATH}"
 
+echo "==> Generating SHA-256 checksum..."
+SHA_PATH="${DMG_PATH}.sha256"
+( cd "$(dirname "${DMG_PATH}")" && shasum -a 256 "$(basename "${DMG_PATH}")" ) > "${SHA_PATH}"
+echo "==> Wrote ${SHA_PATH}"
+cat "${SHA_PATH}"
+
 echo
 echo "================================================================="
 echo " SUCCESS"
 echo " Signed + notarized DMG: ${DMG_PATH}"
+echo " SHA-256 checksum:       ${SHA_PATH}"
 echo "================================================================="
