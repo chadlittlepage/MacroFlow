@@ -211,8 +211,10 @@ class TestSafeWrappersDefaults:
         self, monkeypatch,
     ):
         # Simulate the worker returning the default (False) on timeout.
+        # The signature has to accept coalesce_key now that the safe_*
+        # wrappers pass one for queue-coalescing back-pressure.
         monkeypatch.setattr(
             resolve, "_run_off_main",
-            lambda fn, *, timeout=5.0, default=None: default,
+            lambda fn, *, timeout=5.0, default=None, coalesce_key=None: default,
         )
         assert resolve.safe_apply_track_state({1: True}) is False

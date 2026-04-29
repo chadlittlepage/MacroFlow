@@ -54,6 +54,7 @@ def _grid_to_persistent_dict(g: MacroGrid) -> dict:
             "hotkey": g.hotkey_font_size,
         },
         "timeline_resolution": g.timeline_resolution,
+        "force_refresh_during_playback": g.force_refresh_during_playback,
         "macros": {mid: m.to_dict() for mid, m in g.macros.items()},
         "presets": dict(g.presets),
     }

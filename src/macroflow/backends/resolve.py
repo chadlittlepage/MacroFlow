@@ -33,6 +33,20 @@ import threading
 # failed: [idx, ...]}
 LAST_APPLY: dict = {}
 
+# EXPERIMENTAL — default OFF.
+# When True, apply_video_track_transforms briefly toggles the track
+# enable flag off-then-on after a successful write so Resolve flushes
+# its playback frame cache and the new transform takes effect on the
+# very next rendered frame — even mid-playback.
+# Known to occasionally hang Resolve's playback engine on some
+# projects, so the user has to opt in via Settings.
+FORCE_REFRESH_DURING_PLAYBACK: bool = False
+
+
+def set_force_refresh_during_playback(enabled: bool) -> None:
+    global FORCE_REFRESH_DURING_PLAYBACK
+    FORCE_REFRESH_DURING_PLAYBACK = bool(enabled)
+
 _MODULE_DIRS = [
     "/Library/Application Support/Blackmagic Design/DaVinci Resolve/"
     "Developer/Scripting/Modules",
@@ -442,6 +456,12 @@ def apply_video_track_transforms(transforms: dict[int, dict]) -> bool:
     items = None
     clip = None
     frame = _current_frame(tl)
+    # Tracks that got at least one SetProperty write. We toggle their
+    # enable flag at the end if FORCE_REFRESH_DURING_PLAYBACK is set —
+    # forces Resolve to flush its playback frame cache so the new
+    # transform takes effect on the very next rendered frame even
+    # mid-playback. Cost: one black frame on the affected track.
+    written_tracks: list[int] = []
     try:
         for idx, xform in transforms.items():
             try:
@@ -464,6 +484,7 @@ def apply_video_track_transforms(transforms: dict[int, dict]) -> bool:
                     f"[resolve] V{idx}: no clip at playhead — skipping transform"
                 )
                 continue
+            wrote_this_track = False
             for our_key, resolve_key in property_map.items():
                 val = xform.get(our_key) if isinstance(xform, dict) else None
                 if val is None:
@@ -480,6 +501,7 @@ def apply_video_track_transforms(transforms: dict[int, dict]) -> bool:
                         if cur == target:
                             continue
                         clip.SetProperty(resolve_key, target)
+                        wrote_this_track = True
                     else:
                         target_f = float(val)
                         try:
@@ -489,14 +511,33 @@ def apply_video_track_transforms(transforms: dict[int, dict]) -> bool:
                         if cur_f is not None and abs(cur_f - target_f) <= EPSILON:
                             continue
                         clip.SetProperty(resolve_key, target_f)
+                        wrote_this_track = True
                 except Exception as e:
                     print(f"[resolve] SetProperty V{idx} {resolve_key}={val}: {e}")
                     ok = False
+            if wrote_this_track:
+                written_tracks.append(int(idx))
             # Drop per-track ScriptVal refs before the next iteration so
             # they're freed on this thread, not whichever thread later GCs
             # the loop locals.
             clip = None
             items = None
+
+        # Force-refresh: toggle each written track's enable flag off→on
+        # so Resolve flushes its playback frame cache and re-evaluates
+        # with the new transform on the next rendered frame. This is what
+        # makes mid-playback quadrant swaps actually take effect; without
+        # it, Resolve happily reads the stale cached transform until a
+        # clip boundary forces a reload. Cost: one black frame per track.
+        if FORCE_REFRESH_DURING_PLAYBACK and written_tracks:
+            for idx in written_tracks:
+                try:
+                    tl.SetTrackEnable("video", int(idx), False)
+                    tl.SetTrackEnable("video", int(idx), True)
+                except Exception as e:
+                    print(
+                        f"[resolve] V{idx}: force-refresh toggle failed: {e}"
+                    )
         return ok
     finally:
         del tl, items, clip
@@ -612,6 +653,15 @@ def get_current_timecode() -> str | None:
 _WORKER_QUEUE: "queue.Queue[tuple]" = queue.Queue()
 _WORKER_THREAD: threading.Thread | None = None
 _WORKER_LOCK = threading.Lock()
+# Tracks pending coalesce_keys so duplicate work fired in quick succession
+# (e.g. user mashes a macro 10x while Resolve is busy playing) collapses
+# down to AT MOST one queued + one in-flight invocation per key.
+_PENDING_KEYS: set[str] = set()
+# Hard cap on queue depth. When the queue fills (Resolve busy / playing,
+# user spamming macros), additional submissions are dropped instead of
+# piling up. Prevents the "stop Resolve → editor flashes 10× catching up"
+# behavior. ~3 in-flight is plenty for our workload.
+_MAX_QUEUE_DEPTH = 3
 
 
 def _worker_loop() -> None:
@@ -619,7 +669,7 @@ def _worker_loop() -> None:
         item = _WORKER_QUEUE.get()
         if item is None:  # shutdown sentinel (unused today; here for safety)
             return
-        fn, result_box, err_box, done = item
+        fn, result_box, err_box, done, key = item
         try:
             result_box.append(fn())
         except Exception as e:
@@ -634,6 +684,9 @@ def _worker_loop() -> None:
                 gc.collect()
             except Exception:
                 pass
+            if key is not None:
+                with _WORKER_LOCK:
+                    _PENDING_KEYS.discard(key)
             done.set()
 
 
@@ -651,19 +704,51 @@ def _ensure_worker() -> None:
         _WORKER_THREAD.start()
 
 
-def _run_off_main(fn, *, timeout: float = 5.0, default=None):
+def _run_off_main(
+    fn,
+    *,
+    timeout: float = 5.0,
+    default=None,
+    coalesce_key: str | None = None,
+):
     """Run a callable on the persistent Resolve worker thread.
 
     Every Resolve/Fusion call goes through here so ScriptVal lifetimes
     stay on a single thread. After fn() returns, gc.collect() runs on the
     worker thread to deterministically free any ScriptVal refs created
     inside fn before control returns to the caller.
+
+    Back-pressure:
+      • When ``coalesce_key`` is set and an identical-key call is already
+        pending or in-flight, the new call is dropped (returns ``default``)
+        — so mashing a macro 10× while Resolve is playing collapses to
+        one queued + one in-flight invocation, not 10.
+      • If the queue depth exceeds _MAX_QUEUE_DEPTH, the new call is
+        also dropped. Prevents the "stop Resolve → 10 flashes catch up"
+        symptom on slow Fusion bridges.
     """
     _ensure_worker()
+    if coalesce_key is not None:
+        with _WORKER_LOCK:
+            if coalesce_key in _PENDING_KEYS:
+                # Same op already pending — drop this one. Treated as a
+                # success no-op so the macro's other backends still fire.
+                return default
+            _PENDING_KEYS.add(coalesce_key)
+    elif _WORKER_QUEUE.qsize() >= _MAX_QUEUE_DEPTH:
+        # Unkeyed call but the queue is saturated — drop rather than
+        # let the producer outrun the consumer.
+        name = getattr(fn, "__name__", None) or getattr(fn, "func", fn).__name__
+        print(
+            f"[resolve] {name} dropped — worker queue saturated "
+            f"(>{_MAX_QUEUE_DEPTH} pending, Resolve likely busy/playing)"
+        )
+        return default
+
     result_box: list = []
     err_box: list = []
     done = threading.Event()
-    _WORKER_QUEUE.put((fn, result_box, err_box, done))
+    _WORKER_QUEUE.put((fn, result_box, err_box, done, coalesce_key))
     if not done.wait(timeout=timeout):
         name = getattr(fn, "__name__", None) or getattr(fn, "func", fn).__name__
         print(f"[resolve] {name} timed out after {timeout}s")
@@ -689,13 +774,39 @@ def safe_get_current_timecode() -> str | None:
 
 def safe_apply_track_state(track_state: dict[int, bool]) -> bool:
     from functools import partial
-    return bool(_run_off_main(partial(apply_track_state, track_state), default=False))
+    # Coalesce identical writes — if a previous apply_track_state with
+    # the same payload is still pending, the new one is dropped. Keeps
+    # mashing a macro 10× while Resolve plays from queueing 10 writes.
+    key = "apply_track_state:" + ",".join(
+        f"{k}={1 if v else 0}" for k, v in sorted(track_state.items())
+    )
+    return bool(_run_off_main(
+        partial(apply_track_state, track_state),
+        default=False, coalesce_key=key,
+    ))
 
 
 def safe_apply_video_track_transforms(transforms: dict[int, dict]) -> bool:
     from functools import partial
+    # Coalesce by track-set + the values' rounded float signatures so
+    # identical drag-scrub mouseups don't enqueue twice. Different
+    # values produce different keys so a real change still goes through.
+    parts = []
+    for idx in sorted(transforms.keys()):
+        x = transforms[idx]
+        if not isinstance(x, dict):
+            parts.append(f"{idx}=NA")
+            continue
+        sig = "|".join(
+            f"{k}={round(float(v), 4)}" if isinstance(v, (int, float))
+            else f"{k}={v}"
+            for k, v in sorted(x.items()) if v is not None
+        )
+        parts.append(f"{idx}={sig}")
+    key = "apply_video_track_transforms:" + ";".join(parts)
     return bool(_run_off_main(
-        partial(apply_video_track_transforms, transforms), default=False,
+        partial(apply_video_track_transforms, transforms),
+        default=False, coalesce_key=key,
     ))
 
 

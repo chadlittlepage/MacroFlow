@@ -103,6 +103,20 @@ class _SettingsController(NSObject):
         rows, cols = GRID_CHOICES[idx]
         self.controller.apply_grid_size(rows, cols)
 
+    def forceRefreshChanged_(self, sender):  # NOQA: N802
+        on = bool(int(sender.state()) == 1)
+        self.controller._store.grid.force_refresh_during_playback = on
+        try:
+            from macroflow.backends import resolve as _r
+            _r.set_force_refresh_during_playback(on)
+        except Exception:
+            pass
+        try:
+            self.controller._store.save()
+        except Exception as e:
+            print(f"[settings] save after force-refresh change failed: {e}")
+        print(f"[settings] force_refresh_during_playback = {on}")
+
     def timelineResolutionChanged_(self, sender):  # NOQA: N802
         keys = getattr(self, "_tl_choice_keys", None) or ["auto"]
         idx = int(sender.indexOfSelectedItem())
@@ -240,6 +254,13 @@ class _SettingsController(NSObject):
             )
             self.keep_on_top_check.setState_(0)
             self.global_hotkeys_check.setState_(0)
+            if hasattr(self, "force_refresh_check"):
+                self.force_refresh_check.setState_(0)
+            try:
+                from macroflow.backends import resolve as _r
+                _r.set_force_refresh_during_playback(False)
+            except Exception:
+                pass
             if hasattr(self, "tl_popup"):
                 self.tl_popup.selectItemAtIndex_(0)
         except Exception:
@@ -473,6 +494,17 @@ def show_settings_window(controller) -> None:
         "Hotkeys fire even when MacroFlow is not focused.\n"
         "Requires Accessibility permission.",
         grid.global_hotkeys, "globalHotkeysToggled:",
+    )
+    sc.force_refresh_check = _add_toggle(
+        sect_y - 116, "Force refresh during playback (experimental)",
+        "After a quadrant / transform change, briefly toggle the track\n"
+        "enable flag so Resolve flushes its playback cache and the change\n"
+        "takes effect on the next rendered frame — even mid-playback.\n"
+        "WARNING: this can hang Resolve's playback engine on some\n"
+        "projects. If Resolve goes unresponsive after a macro fires,\n"
+        "turn this off.",
+        getattr(grid, "force_refresh_during_playback", False),
+        "forceRefreshChanged:",
     )
 
     # Bottom row — Reset to Defaults (font sizes only) + Reset All

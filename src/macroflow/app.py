@@ -161,6 +161,16 @@ class AppController(NSObject):
         self._in_undo = False
         videohub.set_mock_mode(self._store.grid.mock_videohub)
         videohub.set_enabled(self._store.grid.videohub_enabled)
+        # Push the playback-refresh setting into the resolve backend so
+        # apply_video_track_transforms knows whether to toggle the track
+        # enable flag after each write (forces mid-playback re-render).
+        try:
+            from macroflow.backends import resolve as _resolve_backend
+            _resolve_backend.set_force_refresh_during_playback(
+                bool(self._store.grid.force_refresh_during_playback),
+            )
+        except Exception:
+            pass
         # Init the VHC notification bridge on the main thread before any
         # macro fire (which runs on a worker thread) can use it. Even when
         # videohub is disabled at startup, the bridge stays available so a
@@ -1842,6 +1852,13 @@ class AppController(NSObject):
             # Reload into our running store and refresh the UI in place.
             self._store = MacroStore()
             videohub.set_mock_mode(self._store.grid.mock_videohub)
+            try:
+                from macroflow.backends import resolve as _r
+                _r.set_force_refresh_during_playback(
+                    bool(self._store.grid.force_refresh_during_playback),
+                )
+            except Exception:
+                pass
             self._refresh_cell_titles()
             self._lcd.setStringValue_(f"Imported settings from {src}")
         except Exception as e:

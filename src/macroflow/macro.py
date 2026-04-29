@@ -242,6 +242,17 @@ class MacroGrid:
     # compound-clip / nested-timeline projects.
     # Valid values: "auto" | "1920x1080" | "3840x2160" | "7680x4320"
     timeline_resolution: str = "auto"
+    # EXPERIMENTAL — default OFF.
+    # When True, after a successful clip transform write, MacroFlow
+    # toggles the track's enable flag off-then-on so Resolve flushes
+    # its playback frame cache and the new Pan/Tilt takes effect on
+    # the next rendered frame — even mid-playback.
+    # Known issue: on some projects (and especially during active
+    # playback) the rapid SetTrackEnable(False)/SetTrackEnable(True)
+    # has been observed to hang Resolve's playback engine. If you
+    # turn this on and Resolve goes unresponsive, turn it back off in
+    # Settings → Window & Hotkey Behavior.
+    force_refresh_during_playback: bool = False
 
     @staticmethod
     def cell_id(row: int, col: int) -> str:
@@ -301,6 +312,9 @@ class MacroStore:
         self.grid.timeline_resolution = str(
             data.get("timeline_resolution", "auto"),
         )
+        self.grid.force_refresh_during_playback = bool(
+            data.get("force_refresh_during_playback", False),
+        )
         self.grid.macros = {
             mid: Macro.from_dict(m) for mid, m in (data.get("macros") or {}).items()
         }
@@ -326,6 +340,7 @@ class MacroStore:
                 "hotkey": self.grid.hotkey_font_size,
             },
             "timeline_resolution": self.grid.timeline_resolution,
+            "force_refresh_during_playback": self.grid.force_refresh_during_playback,
             "macros": {mid: m.to_dict() for mid, m in self.grid.macros.items()},
             "presets": dict(self.grid.presets),
         }
