@@ -55,24 +55,34 @@ jobs:
         env:
           PYTHONPATH: src
         run: |
-          pip install pytest pytest-cov coverage-badge setuptools
+          pip install pytest pytest-cov
           pytest tests/ -q \
             --cov=macroflow \
             --cov-report=term
 
       # Publish a coverage badge to a side branch ("coverage-badge") so the
       # README can pull a raw SVG without depending on Codecov / external
-      # tokens. Only runs on direct pushes to main.
+      # tokens. Only runs on direct pushes to main. Uses shields.io as the
+      # SVG generator — no extra Python deps.
       - name: Publish coverage badge
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          coverage-badge -o /tmp/coverage.svg -f
+          PCT="$(python -m coverage report --format=total)"
+          if [ "${PCT}" -ge 80 ]; then
+            COLOR="brightgreen"
+          elif [ "${PCT}" -ge 60 ]; then
+            COLOR="yellow"
+          else
+            COLOR="red"
+          fi
+          curl -fsSL \
+            "https://img.shields.io/badge/coverage-${PCT}%25-${COLOR}" \
+            -o /tmp/coverage.svg
           git config user.name 'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
-          # Worktree onto an orphan or existing coverage-badge branch.
           rm -rf /tmp/badge-wt
           if git ls-remote --exit-code --heads origin coverage-badge >/dev/null 2>&1; then
             git fetch origin coverage-badge
@@ -90,7 +100,7 @@ jobs:
           if git diff --staged --quiet; then
             echo "Coverage badge unchanged — skipping commit."
           else
-            git commit -m "ci: refresh coverage badge"
+            git commit -m "ci: refresh coverage badge (${PCT}%)"
             git push origin coverage-badge
           fi
 
