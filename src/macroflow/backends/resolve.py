@@ -301,6 +301,21 @@ def apply_video_track_transforms(transforms: dict[int, dict]) -> bool:
     Resolve scripting property names (ZoomX, Pan, FlipX, ...). Tracks not
     in the dict are left untouched. Returns True if every property write
     succeeded.
+
+    **Read-then-write guard.** We read the clip's current value first and
+    only call SetProperty when the value actually differs (within a small
+    epsilon for floats). This avoids two failure modes that have been
+    observed in the wild:
+
+    1. **Resolve crash on macOS 15** when the clip has never had any
+       transforms set and we issue 11 SetProperty calls in rapid
+       succession. The first write seems to trigger Resolve's
+       transform-layer initialization, and the cascade of writes during
+       that init has crashed Resolve. Skipping no-op writes means a
+       quadrant change typically issues 2 writes (Pan + Tilt) instead
+       of all 11, which sidesteps the init storm.
+    2. **Performance** during a slider drag: writes that don't change
+       state still walk Resolve's undo/redo stack and rebuild caches.
     """
     if not transforms:
         return True
@@ -320,6 +335,7 @@ def apply_video_track_transforms(transforms: dict[int, dict]) -> bool:
         "flip_h":         "FlipX",
         "flip_v":         "FlipY",
     }
+    EPSILON = 1e-6
     ok = True
     for idx, xform in transforms.items():
         try:
@@ -333,11 +349,27 @@ def apply_video_track_transforms(transforms: dict[int, dict]) -> bool:
             val = xform.get(our_key) if isinstance(xform, dict) else None
             if val is None:
                 continue
+            # Read current value so we can skip no-op writes.
+            try:
+                cur_raw = clip.GetProperty(resolve_key)
+            except Exception:
+                cur_raw = None
             try:
                 if our_key in ("flip_h", "flip_v"):
-                    clip.SetProperty(resolve_key, 1 if val else 0)
+                    target = 1 if val else 0
+                    cur = 1 if cur_raw else 0
+                    if cur == target:
+                        continue
+                    clip.SetProperty(resolve_key, target)
                 else:
-                    clip.SetProperty(resolve_key, float(val))
+                    target_f = float(val)
+                    try:
+                        cur_f = float(cur_raw) if cur_raw is not None else None
+                    except (TypeError, ValueError):
+                        cur_f = None
+                    if cur_f is not None and abs(cur_f - target_f) <= EPSILON:
+                        continue
+                    clip.SetProperty(resolve_key, target_f)
             except Exception as e:
                 print(f"[resolve] SetProperty V{idx} {resolve_key}={val}: {e}")
                 ok = False

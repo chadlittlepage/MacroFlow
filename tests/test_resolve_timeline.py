@@ -308,6 +308,10 @@ class TestGetVideoTrackTransforms:
 
 class TestApplyVideoTrackTransforms:
     def test_writes_property_map_correctly(self, monkeypatch):
+        # Clip starts with all properties unset (GetProperty returns None);
+        # every non-zero target should produce a write. Targets that match
+        # the implicit "0" default (FlipY=False, AnchorPointX=0.0, etc.)
+        # are skipped by the read-then-write guard.
         clip = FakeClip()
         tl = FakeTimeline(tracks={1: [clip]})
         monkeypatch.setattr(resolve, "_current_timeline", lambda: tl)
@@ -323,8 +327,9 @@ class TestApplyVideoTrackTransforms:
             },
         })
         assert ok is True
-        # Internal-name → Resolve-name mapping must hold.
         seen = dict(clip.set_calls)
+        # Float properties: writes happen when cur_raw is None (no current
+        # value), so all numeric targets land — even the 0.0s.
         assert seen["ZoomX"] == 0.5
         assert seen["ZoomY"] == 0.5
         assert seen["Pan"] == -1920.0
@@ -334,9 +339,81 @@ class TestApplyVideoTrackTransforms:
         assert seen["AnchorPointY"] == 0.0
         assert seen["Pitch"] == 0.0
         assert seen["Yaw"] == 0.0
-        # flip_* writes 1/0, not True/False.
+        # flip_* uses bool-coercion: 1 if cur_raw else 0 == 0 when cur_raw
+        # is None. Target FlipX=True → 1 differs from 0 → write happens.
         assert seen["FlipX"] == 1
-        assert seen["FlipY"] == 0
+        # Target FlipY=False → 0, current resolves to 0 → no-op skip.
+        assert "FlipY" not in seen
+
+    def test_no_op_writes_are_skipped(self, monkeypatch):
+        # Clip already at the target values; apply should be a complete
+        # no-op. This is the macOS 15 + Resolve crash mitigation: don't
+        # tickle the transform-layer init when nothing actually changes.
+        clip = FakeClip(props={
+            "ZoomX": 0.5, "ZoomY": 0.5,
+            "Pan": -1920.0, "Tilt": 1080.0,
+            "RotationAngle": 90.0,
+            "AnchorPointX": 0.0, "AnchorPointY": 0.0,
+            "Pitch": 0.0, "Yaw": 0.0,
+            "FlipX": 1.0, "FlipY": 0.0,
+        })
+        tl = FakeTimeline(tracks={1: [clip]})
+        monkeypatch.setattr(resolve, "_current_timeline", lambda: tl)
+        ok = resolve.apply_video_track_transforms({
+            1: {
+                "zoom_x": 0.5, "zoom_y": 0.5,
+                "position_x": -1920.0, "position_y": 1080.0,
+                "rotation_angle": 90.0,
+                "anchor_point_x": 0.0, "anchor_point_y": 0.0,
+                "pitch": 0.0, "yaw": 0.0,
+                "flip_h": True, "flip_v": False,
+            },
+        })
+        assert ok is True
+        assert clip.set_calls == [], (
+            "no SetProperty calls should fire when current values match"
+        )
+
+    def test_only_changed_values_are_written(self, monkeypatch):
+        # Quadrant change: only Pan + Tilt should be written when the rest
+        # of the transform already matches. This is the typical macOS 15
+        # repro — quadrant flip from Q1 → Q2 used to issue 11 writes.
+        clip = FakeClip(props={
+            "ZoomX": 1.0, "ZoomY": 1.0,
+            "Pan": -1920.0, "Tilt": 1080.0,   # currently Q1
+            "RotationAngle": 0.0,
+            "AnchorPointX": 0.0, "AnchorPointY": 0.0,
+            "Pitch": 0.0, "Yaw": 0.0,
+            "FlipX": 0.0, "FlipY": 0.0,
+        })
+        tl = FakeTimeline(tracks={1: [clip]})
+        monkeypatch.setattr(resolve, "_current_timeline", lambda: tl)
+        # Push the full xform dict but with new Pan/Tilt for Q2.
+        resolve.apply_video_track_transforms({
+            1: {
+                "zoom_x": 1.0, "zoom_y": 1.0,
+                "position_x": 1920.0, "position_y": 1080.0,  # Q2
+                "rotation_angle": 0.0,
+                "anchor_point_x": 0.0, "anchor_point_y": 0.0,
+                "pitch": 0.0, "yaw": 0.0,
+                "flip_h": False, "flip_v": False,
+            },
+        })
+        keys_written = {k for k, _ in clip.set_calls}
+        # Q1 → Q2 keeps Tilt the same (top row stays top row), only Pan
+        # flips sign. So only Pan should be written.
+        assert keys_written == {"Pan"}
+
+    def test_float_epsilon_skips_near_identical_values(self, monkeypatch):
+        # Tiny float drift (e.g. JSON serialization roundtrip) should NOT
+        # trigger a redundant write — that's what the EPSILON guard is for.
+        clip = FakeClip(props={"Pan": 1920.0})
+        tl = FakeTimeline(tracks={1: [clip]})
+        monkeypatch.setattr(resolve, "_current_timeline", lambda: tl)
+        resolve.apply_video_track_transforms({
+            1: {"position_x": 1920.0 + 1e-9},  # under EPSILON (1e-6)
+        })
+        assert clip.set_calls == []
 
     def test_skips_track_with_no_clips(self, monkeypatch):
         tl = FakeTimeline(tracks={1: [], 2: [FakeClip()]})
