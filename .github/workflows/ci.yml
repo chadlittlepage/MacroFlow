@@ -45,11 +45,18 @@ jobs:
           python -c "
           from macroflow import (
               app, macro, macro_editor, settings_window, about_window,
-              log_capture, console_window, help_window,
+              log_capture, console_window, help_window, quad_preview,
           )
-          from macroflow.backends import resolve, videohub
+          from macroflow.backends import resolve, videohub, local_dimming
           print('all modules import cleanly')
           "
+
+      - name: Pytest
+        env:
+          PYTHONPATH: src
+        run: |
+          pip install pytest
+          pytest tests/ -q
 
   build-dry-run:
     name: py2app dry build
@@ -70,6 +77,16 @@ jobs:
           pip install pyobjc-core pyobjc-framework-Cocoa pyobjc-framework-Quartz
 
       - name: Build .app (no signing)
+        # py2app trips on `pyproject.toml [project] dependencies` with
+        # newer setuptools ("install_requires is no longer supported"),
+        # so we move pyproject.toml out of the way for the build —
+        # mirrors what build_and_sign.sh does locally.
         run: |
+          if [ -f pyproject.toml ]; then
+            mv pyproject.toml pyproject.toml.bak
+          fi
           python setup.py py2app -A
+          if [ -f pyproject.toml.bak ]; then
+            mv pyproject.toml.bak pyproject.toml
+          fi
           test -d dist/MacroFlow.app
