@@ -1114,7 +1114,7 @@ class AppController(NSObject):
         self._title_layers.clear()
         self._hotkey_layers.clear()
         # The previously-outlined "selected" cell is gone now too.
-        self._selected_fire_key = None
+        self._selected_fire_key: tuple[int, int] | None = None
         self._store.grid.rows = int(rows)
         self._store.grid.cols = int(cols)
         # Rebuild cells at provisional sizes; _relayout immediately reflows.
