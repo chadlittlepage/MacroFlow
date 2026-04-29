@@ -104,7 +104,8 @@ _FN_KEYCODES = {
 
 GRID_PADDING = 16
 CELL_PADDING = 8
-LCD_HEIGHT = 36
+LCD_HEIGHT = 36                      # baseline height at default display font
+LCD_DEFAULT_FONT_PT = 12.0           # display_font_size that LCD_HEIGHT was tuned for
 STATUS_BAR_HEIGHT = 32
 DOT_DIAMETER = 10
 GREEN_RGB = (0.20, 0.80, 0.35, 1.0)
@@ -174,7 +175,10 @@ class AppController(NSObject):
         # scales cells to whatever the user resizes the window to.
         cell_w, cell_h = 140, 100
         win_w = GRID_PADDING * 2 + cols * cell_w + (cols - 1) * CELL_PADDING
-        top_strip = LCD_HEIGHT + STATUS_BAR_HEIGHT + 8
+        # LCD strip grows with the display font so big fonts stay centered
+        # and the GUI gets pushed down rather than overlapped.
+        self._lcd_height = self._lcd_height_for_font()
+        top_strip = self._lcd_height + STATUS_BAR_HEIGHT + 8
         win_h = GRID_PADDING * 2 + rows * cell_h + (rows - 1) * CELL_PADDING + top_strip
         self._top_strip = top_strip
 
@@ -188,6 +192,14 @@ class AppController(NSObject):
         )
         self._window.setTitle_("MacroFlow")
         self._window.setReleasedWhenClosed_(False)
+        # Enable Cmd+F (View → Toggle Full Screen). Without
+        # NSWindowCollectionBehaviorFullScreenPrimary the AppKit selector
+        # toggleFullScreen: is a no-op and the menu item stays disabled.
+        try:
+            current_behavior = int(self._window.collectionBehavior())
+            self._window.setCollectionBehavior_(current_behavior | (1 << 7))
+        except Exception:
+            pass
         self._window.setBackgroundColor_(
             NSColor.colorWithCalibratedRed_green_blue_alpha_(*WINDOW_BG),
         )
@@ -220,9 +232,9 @@ class AppController(NSObject):
         # LCD strip (last fired macro / hover description). Full width.
         # Olive-on-dark to match Videohub Controller's title-bar LCD display.
         lcd_w = win_w - GRID_PADDING * 2
-        lcd_strip_h = LCD_HEIGHT - 6
+        lcd_strip_h = self._lcd_height - 6
         lcd_wrap = NSView.alloc().initWithFrame_(
-            NSMakeRect(GRID_PADDING, win_h - LCD_HEIGHT - 4,
+            NSMakeRect(GRID_PADDING, win_h - self._lcd_height - 4,
                        lcd_w, lcd_strip_h),
         )
         lcd_wrap.setWantsLayer_(True)
@@ -236,7 +248,7 @@ class AppController(NSObject):
             lcd_wrap.layer().setMasksToBounds_(True)
         content.addSubview_(lcd_wrap)
         # Text field placed manually at the vertical centre of the strip.
-        text_h = 18
+        text_h = self._lcd_text_height_for_font()
         lcd = NSTextField.alloc().initWithFrame_(
             NSMakeRect(8, (lcd_strip_h - text_h) / 2,
                        lcd_w - 16, text_h),
@@ -262,7 +274,7 @@ class AppController(NSObject):
 
         # Status bar — connection dots for Videohub Controller + Resolve.
         # Sits directly below the LCD, where the diagnostics panel used to be.
-        bar_y = win_h - LCD_HEIGHT - STATUS_BAR_HEIGHT - 6
+        bar_y = win_h - self._lcd_height - STATUS_BAR_HEIGHT - 6
         # DAVINCI RESOLVE first (left-most) so it stays left-justified when
         # the Videohub indicator is hidden via Settings.
         label_h = 16
@@ -371,7 +383,7 @@ class AppController(NSObject):
         self._refresh_status_dots()
 
         # Grid — start below the LCD and status bar.
-        grid_top = win_h - LCD_HEIGHT - STATUS_BAR_HEIGHT - 8
+        grid_top = win_h - self._lcd_height - STATUS_BAR_HEIGHT - 8
         for r in range(rows):
             for c in range(cols):
                 x = GRID_PADDING + c * (cell_w + CELL_PADDING)
@@ -937,6 +949,28 @@ class AppController(NSObject):
         self._position_text_layers(btn, title, hk)
 
     @objc.python_method
+    def _lcd_height_for_font(self) -> int:
+        """LCD strip height that scales with the display font so the text
+        stays visually centered as it grows. Anchored at LCD_HEIGHT for
+        font sizes <= LCD_DEFAULT_FONT_PT so the default look is unchanged."""
+        try:
+            pt = float(self._store.grid.display_font_size)
+        except Exception:
+            pt = LCD_DEFAULT_FONT_PT
+        scale = max(1.0, pt / LCD_DEFAULT_FONT_PT)
+        return int(LCD_HEIGHT * scale)
+
+    @objc.python_method
+    def _lcd_text_height_for_font(self) -> int:
+        """Height of the LCD text field — must match the rendered glyph
+        box so we can vertically center it in the strip."""
+        try:
+            pt = float(self._store.grid.display_font_size)
+        except Exception:
+            pt = LCD_DEFAULT_FONT_PT
+        return max(18, int(pt * 1.4 + 4))
+
+    @objc.python_method
     def _apply_font_sizes(self) -> None:
         """Push current font sizes from the store into the live UI.
         Wrapped in a CATransaction with implicit animations disabled so
@@ -947,6 +981,16 @@ class AppController(NSObject):
             ))
         except Exception:
             pass
+        # Grow the LCD strip + top strip so the display font stays centered
+        # and the rest of the GUI gets pushed down rather than overlapped.
+        new_lcd_h = self._lcd_height_for_font()
+        if new_lcd_h != getattr(self, "_lcd_height", LCD_HEIGHT):
+            self._lcd_height = new_lcd_h
+            self._top_strip = new_lcd_h + STATUS_BAR_HEIGHT + 8
+            try:
+                self._relayout()
+            except Exception:
+                pass
         title_pt = float(self._store.grid.title_font_size)
         hotkey_pt = float(self._store.grid.hotkey_font_size)
         try:
@@ -1351,20 +1395,22 @@ class AppController(NSObject):
                 NSMakeRect(0, win_h - self._top_strip, win_w, self._top_strip),
             )
 
-        # LCD strip — full width.
+        # LCD strip — full width. Height tracks the display font size so big
+        # fonts stay vertically centered with breathing room.
+        lcd_h = getattr(self, "_lcd_height", LCD_HEIGHT)
         lcd_w = win_w - GRID_PADDING * 2
-        lcd_strip_h = LCD_HEIGHT - 6
+        lcd_strip_h = lcd_h - 6
         self._lcd_wrap.setFrame_(
-            NSMakeRect(GRID_PADDING, win_h - LCD_HEIGHT - 4, lcd_w, lcd_strip_h),
+            NSMakeRect(GRID_PADDING, win_h - lcd_h - 4, lcd_w, lcd_strip_h),
         )
         # Re-center the text field inside the wrapper.
-        text_h = 18
+        text_h = self._lcd_text_height_for_font()
         self._lcd.setFrame_(
             NSMakeRect(8, (lcd_strip_h - text_h) / 2, lcd_w - 16, text_h),
         )
 
         # Status bar.
-        bar_y = win_h - LCD_HEIGHT - STATUS_BAR_HEIGHT - 6
+        bar_y = win_h - lcd_h - STATUS_BAR_HEIGHT - 6
         label_h = 16
         label_y = bar_y + (STATUS_BAR_HEIGHT - label_h) / 2
         dot_y = bar_y + (STATUS_BAR_HEIGHT - DOT_DIAMETER) / 2
@@ -1384,12 +1430,30 @@ class AppController(NSObject):
             NSMakeRect(vh_x + DOT_DIAMETER + 6, label_y, 76, label_h),
         )
 
+        # Preset row (popup + Save + Delete) shares the status-bar y-band on the
+        # right. Autoresizing only handles window-size changes, so we
+        # reposition explicitly when the LCD strip grows.
+        BTN_W = 64
+        BTN_H = 24
+        POPUP_W = 200
+        right_edge = win_w - GRID_PADDING
+        row_y = bar_y + (STATUS_BAR_HEIGHT - BTN_H) / 2
+        del_x = right_edge - BTN_W
+        save_x = del_x - BTN_W - 6
+        popup_x = save_x - POPUP_W - 6
+        if hasattr(self, "_preset_popup"):
+            self._preset_popup.setFrame_(NSMakeRect(popup_x, row_y, POPUP_W, BTN_H))
+        if hasattr(self, "_preset_save_btn"):
+            self._preset_save_btn.setFrame_(NSMakeRect(save_x, row_y, BTN_W, BTN_H))
+        if hasattr(self, "_preset_delete_btn"):
+            self._preset_delete_btn.setFrame_(NSMakeRect(del_x, row_y, BTN_W, BTN_H))
+
         # Grid cells fill the remaining area, dividing it evenly.
         avail_w = win_w - GRID_PADDING * 2 - (cols - 1) * CELL_PADDING
         avail_h = (win_h - self._top_strip - GRID_PADDING - CELL_PADDING - (rows - 1) * CELL_PADDING)
         cell_w = max(1.0, avail_w / cols)
         cell_h = max(1.0, avail_h / rows)
-        grid_top = win_h - LCD_HEIGHT - STATUS_BAR_HEIGHT - 8
+        grid_top = win_h - lcd_h - STATUS_BAR_HEIGHT - 8
         for (r, c), btn in self._cell_buttons.items():
             x = GRID_PADDING + c * (cell_w + CELL_PADDING)
             y = grid_top - (r + 1) * cell_h - r * CELL_PADDING - CELL_PADDING

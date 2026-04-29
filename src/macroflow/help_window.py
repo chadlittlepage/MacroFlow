@@ -219,7 +219,13 @@ Function keys F1–F12 are matched by keycode (no charactersIgnoring).
 
 SETTINGS  (Cmd+,)
 -----------------
-  Display / Title / Hotkey font size sliders.
+  Display / Title / Hotkey font sliders.
+                                     Display + Title go up to 40 pt;
+                                     Hotkey goes up to 60 pt. The LCD
+                                     strip auto-grows so the display
+                                     font stays vertically centered;
+                                     the status row + grid push down
+                                     rather than overlap.
   Reset to Defaults                  Restores 12 / 13 / 26 pt (undoable).
   Grid size                          4×4, 6×6, 8×8, 10×10, 12×12, 20×20,
                                      40×40. Live-resize without restart.

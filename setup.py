@@ -21,7 +21,9 @@ BUNDLE_ID = "com.chadlittlepage.macroflow"
 
 APP = ["app_entry.py"]
 
-DATA_FILES: list = []
+DATA_FILES = [
+    ("assets", ["assets/about_background.jpg"]),
+]
 
 OPTIONS = {
     "argv_emulation": False,

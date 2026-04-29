@@ -228,10 +228,10 @@ def show_settings_window(controller) -> None:
         return label, slider
 
     sc.display_label, sc.display_slider = add_slider(
-        win_h - 70, "Display", grid.display_font_size, 8, 22, "displayChanged:",
+        win_h - 70, "Display", grid.display_font_size, 8, 40, "displayChanged:",
     )
     sc.title_label, sc.title_slider = add_slider(
-        win_h - 130, "Title", grid.title_font_size, 8, 24, "titleChanged:",
+        win_h - 130, "Title", grid.title_font_size, 8, 40, "titleChanged:",
     )
     sc.hotkey_label, sc.hotkey_slider = add_slider(
         win_h - 190, "Hotkey", grid.hotkey_font_size, 12, 60, "hotkeyChanged:",

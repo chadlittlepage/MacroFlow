@@ -20,6 +20,8 @@ window_rect = ((200, 120), (600, 400))
 icon_size = 105
 text_size = 13
 
+background = "assets/dmg_background.jpg"
+
 files = [APP_BUNDLE]
 symlinks = {"Applications": "/Applications"}
 
