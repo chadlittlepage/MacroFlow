@@ -34,6 +34,8 @@ class FakeClip:
         self,
         props: dict | None = None,
         raise_on: tuple[str, ...] = (),
+        start: int = 0,
+        end: int = 1_000_000,
     ) -> None:
         self.props = props or {}
         self.raise_on = set(raise_on)
@@ -42,6 +44,11 @@ class FakeClip:
         # Whether SetProperty should fail; setting it to a property name
         # makes only that property fail.
         self.fail_set: set[str] = set()
+        # GetStart / GetEnd cover an implausibly wide default range so the
+        # playhead-aware lookup picks any FakeClip by default. Tests that
+        # care about playhead targeting set explicit start / end.
+        self._start = start
+        self._end = end
 
     def GetProperty(self, prop: str):  # NOQA: N802
         if prop in self.raise_on:
@@ -53,6 +60,12 @@ class FakeClip:
             raise RuntimeError(f"SetProperty({prop}) blew up")
         self.set_calls.append((prop, value))
         return True
+
+    def GetStart(self) -> int:  # NOQA: N802
+        return self._start
+
+    def GetEnd(self) -> int:  # NOQA: N802
+        return self._end
 
 
 class FakeTimeline:
@@ -69,13 +82,18 @@ class FakeTimeline:
         track_names: dict[int, str] | None = None,
         enabled_state: dict[int, bool] | None = None,
         timeline_resolution: tuple[int, int] | None = (1920, 1080),
-        timecode: str | None = None,
+        timecode: str | None = "01:00:01:00",
+        framerate: float | None = 24.0,
     ) -> None:
         self.tracks = tracks or {}
         self.track_names = track_names or {}
         self.enabled_state = dict(enabled_state) if enabled_state else {}
         self._resolution = timeline_resolution
+        # Default timecode 01:00:01:00 falls inside FakeClip's default
+        # [0, 1_000_000] frame range, so the playhead-aware clip lookup
+        # picks the first clip on each track without test ceremony.
         self._timecode = timecode
+        self._framerate = framerate
         # Capture for assertions
         self.set_track_calls: list[tuple[int, bool]] = []
         # Knobs for forcing failures on specific tracks
@@ -118,6 +136,8 @@ class FakeTimeline:
         return True
 
     def GetSetting(self, key: str):  # NOQA: N802
+        if key == "timelineFrameRate":
+            return str(self._framerate) if self._framerate else None
         if self._resolution is None:
             return None
         if key == "timelineResolutionWidth":
@@ -413,6 +433,39 @@ class TestApplyVideoTrackTransforms:
         resolve.apply_video_track_transforms({
             1: {"position_x": 1920.0 + 1e-9},  # under EPSILON (1e-6)
         })
+        assert clip.set_calls == []
+
+    def test_writes_target_clip_at_playhead_not_leftmost(self, monkeypatch):
+        # Three clips on V1, playhead inside the middle one. Only the
+        # middle clip should receive the SetProperty calls.
+        # Frame math: timecode "01:00:05:00" at 24fps = 86400 + 120 = 86520.
+        leftmost = FakeClip(start=86400, end=86460)        # 01:00:00 - 01:00:02:12
+        middle = FakeClip(start=86460, end=86600)          # 01:00:02:12 - 01:00:08:08
+        rightmost = FakeClip(start=86600, end=86700)       # 01:00:08:08 - 01:00:12:12
+        tl = FakeTimeline(
+            tracks={1: [leftmost, middle, rightmost]},
+            timecode="01:00:05:00",
+            framerate=24.0,
+        )
+        monkeypatch.setattr(resolve, "_current_timeline", lambda: tl)
+        resolve.apply_video_track_transforms({1: {"position_x": 1920.0}})
+        assert leftmost.set_calls == []
+        assert rightmost.set_calls == []
+        assert middle.set_calls == [("Pan", 1920.0)]
+
+    def test_skips_track_with_no_clip_at_playhead(self, monkeypatch):
+        # Playhead is at 01:00:05:00 (frame 86520) but the only clip on V1
+        # ends at frame 86420. Macro should silently skip the track —
+        # NOT corrupt the leftmost clip.
+        clip = FakeClip(start=86400, end=86420)
+        tl = FakeTimeline(
+            tracks={1: [clip]},
+            timecode="01:00:05:00",
+            framerate=24.0,
+        )
+        monkeypatch.setattr(resolve, "_current_timeline", lambda: tl)
+        ok = resolve.apply_video_track_transforms({1: {"position_x": 1920.0}})
+        assert ok is True
         assert clip.set_calls == []
 
     def test_skips_track_with_no_clips(self, monkeypatch):

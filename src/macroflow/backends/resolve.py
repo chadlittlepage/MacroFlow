@@ -265,6 +265,7 @@ def get_video_track_transforms() -> dict[int, dict]:
     out: dict[int, dict] = {}
     items = None  # rebound each track loop; declared here for the outer finally
     clip = None
+    frame = _current_frame(tl)
     try:
         try:
             n = int(tl.GetTrackCount("video"))
@@ -277,7 +278,12 @@ def get_video_track_transforms() -> dict[int, dict]:
                 items = []
             if not items:
                 continue
-            clip = items[0]
+            # Read transforms from the clip currently under the playhead so
+            # the editor reflects what the user is parked on, not whatever
+            # leftmost clip happens to live on the track.
+            clip = _item_at_frame(items, frame)
+            if clip is None:
+                continue
 
             def _f(prop: str, default: float, _clip=clip) -> float:
                 try:
@@ -316,6 +322,64 @@ def get_video_track_transforms() -> dict[int, dict]:
         return out
     finally:
         del tl, items, clip
+
+
+def _current_frame(tl) -> int | None:
+    """Convert the timeline's current timecode to an absolute frame number.
+
+    Resolve's TimelineItem.GetStart() / GetEnd() are absolute frame numbers
+    (relative to the start of the timeline's "infinite" track ruler, e.g.
+    01:00:00:00 = 86400 at 24 fps). To find the clip at the playhead we
+    need the playhead in the same coordinate system.
+    """
+    if tl is None:
+        return None
+    try:
+        tc = tl.GetCurrentTimecode()
+    except Exception:
+        return None
+    if not tc:
+        return None
+    try:
+        fps_raw = tl.GetSetting("timelineFrameRate")
+    except Exception:
+        fps_raw = None
+    try:
+        fps = float(fps_raw) if fps_raw else 24.0
+    except (TypeError, ValueError):
+        fps = 24.0
+    # "HH:MM:SS:FF" — drop-frame uses ';' between SS and FF; we treat it the
+    # same as ':' since drop-frame compensation only affects the displayed
+    # value, not the absolute frame index.
+    sep = tc.replace(";", ":")
+    parts = sep.split(":")
+    if len(parts) != 4:
+        return None
+    try:
+        h, m, s, f = int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
+    except ValueError:
+        return None
+    return int(round((h * 3600 + m * 60 + s) * fps)) + f
+
+
+def _item_at_frame(items, frame):
+    """Pick the TimelineItem whose [start, end) covers `frame`.
+
+    Used to find the clip at the playhead on a given track. Returns None
+    when no clip on the track covers the playhead — caller decides whether
+    to skip or fall back.
+    """
+    if frame is None:
+        return None
+    for it in items:
+        try:
+            start = int(it.GetStart())
+            end = int(it.GetEnd())
+        except Exception:
+            continue
+        if start <= frame < end:
+            return it
+    return None
 
 
 def _infer_quadrant(pan: float, tilt: float) -> str:
@@ -377,6 +441,7 @@ def apply_video_track_transforms(transforms: dict[int, dict]) -> bool:
     ok = True
     items = None
     clip = None
+    frame = _current_frame(tl)
     try:
         for idx, xform in transforms.items():
             try:
@@ -385,7 +450,20 @@ def apply_video_track_transforms(transforms: dict[int, dict]) -> bool:
                 items = []
             if not items:
                 continue
-            clip = items[0]
+            # Apply transforms to the clip under the playhead, NOT the
+            # leftmost clip on the track. Without this, MacroFlow used to
+            # write to whatever clip happened to be at items[0], which
+            # explains "the editor said it moved but the parked clip didn't"
+            # bugs on multi-clip V1 timelines.
+            clip = _item_at_frame(items, frame)
+            if clip is None:
+                # No clip on this track covers the playhead — nothing to
+                # write. Macro silently skips this track instead of
+                # corrupting the leftmost clip's transform.
+                print(
+                    f"[resolve] V{idx}: no clip at playhead — skipping transform"
+                )
+                continue
             for our_key, resolve_key in property_map.items():
                 val = xform.get(our_key) if isinstance(xform, dict) else None
                 if val is None:
