@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/chadlittlepage/MacroFlow/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/chadlittlepage/MacroFlow/actions/workflows/ci.yml)
 [![CodeQL](https://github.com/chadlittlepage/MacroFlow/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/chadlittlepage/MacroFlow/actions/workflows/codeql.yml)
+[![Coverage](https://raw.githubusercontent.com/chadlittlepage/MacroFlow/coverage-badge/coverage.svg)](https://github.com/chadlittlepage/MacroFlow/actions/workflows/ci.yml)
 [![Ruff](https://img.shields.io/badge/lint-ruff-261230?logo=ruff)](https://github.com/astral-sh/ruff)
 [![Latest release](https://img.shields.io/github/v/release/chadlittlepage/MacroFlow?label=release)](https://github.com/chadlittlepage/MacroFlow/releases/latest)
 [![License: Source-Available](https://img.shields.io/badge/license-source--available-orange)](LICENSE)

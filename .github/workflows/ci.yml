@@ -7,7 +7,7 @@ on:
     branches: [main]
 
 permissions:
-  contents: read
+  contents: write  # needed to publish the coverage badge to a side branch
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -55,10 +55,44 @@ jobs:
         env:
           PYTHONPATH: src
         run: |
-          pip install pytest pytest-cov
+          pip install pytest pytest-cov coverage-badge
           pytest tests/ -q \
             --cov=macroflow \
             --cov-report=term
+
+      # Publish a coverage badge to a side branch ("coverage-badge") so the
+      # README can pull a raw SVG without depending on Codecov / external
+      # tokens. Only runs on direct pushes to main.
+      - name: Publish coverage badge
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          coverage-badge -o /tmp/coverage.svg -f
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          # Worktree onto an orphan or existing coverage-badge branch.
+          rm -rf /tmp/badge-wt
+          if git ls-remote --exit-code --heads origin coverage-badge >/dev/null 2>&1; then
+            git fetch origin coverage-badge
+            git worktree add /tmp/badge-wt origin/coverage-badge
+            cd /tmp/badge-wt
+            git checkout -B coverage-badge
+          else
+            git worktree add --no-checkout /tmp/badge-wt
+            cd /tmp/badge-wt
+            git checkout --orphan coverage-badge
+            git rm -rf . 2>/dev/null || true
+          fi
+          cp /tmp/coverage.svg coverage.svg
+          git add coverage.svg
+          if git diff --staged --quiet; then
+            echo "Coverage badge unchanged — skipping commit."
+          else
+            git commit -m "ci: refresh coverage badge"
+            git push origin coverage-badge
+          fi
 
   build-dry-run:
     name: py2app dry build
