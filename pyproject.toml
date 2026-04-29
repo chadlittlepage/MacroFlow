@@ -22,3 +22,28 @@ where = ["src"]
 [tool.ruff]
 target-version = "py310"
 line-length = 100
+
+# Coverage scoping. Pure-UI modules (Cocoa NSWindow / NSView event
+# handlers, py2app entry shims) need a live NSApplication to execute
+# meaningfully — pytest never starts one, so including them in the
+# denominator just buries the actually-tested code under thousands of
+# unreachable Cocoa-callback lines. Coverage here measures the
+# testable surface: data model, persistence, backends, helpers.
+[tool.coverage.run]
+source = ["src/macroflow"]
+omit = [
+    "src/macroflow/__main__.py",
+    "src/macroflow/app.py",
+    "src/macroflow/about_window.py",
+    "src/macroflow/console_window.py",
+    "src/macroflow/help_window.py",
+    "src/macroflow/log_capture.py",
+    "src/macroflow/macro_editor.py",
+    "src/macroflow/quad_preview.py",
+    "src/macroflow/settings_window.py",
+]
+
+[tool.coverage.report]
+skip_covered = false
+show_missing = true
+precision = 1
