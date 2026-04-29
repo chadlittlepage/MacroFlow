@@ -70,14 +70,20 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          PCT="$(python -m coverage report --format=total)"
-          if [ "${PCT}" -ge 80 ]; then
+          # `coverage report --format=total` returns a decimal like "84.2".
+          # Bash's `[ -ge ]` is integer-only and silently fails on decimals
+          # (the conditional just returns non-zero, so every threshold misses
+          # and we fall through to red). Drop the fractional part first.
+          PCT_RAW="$(python -m coverage report --format=total)"
+          PCT_INT="${PCT_RAW%%.*}"
+          if [ "${PCT_INT}" -ge 80 ]; then
             COLOR="brightgreen"
-          elif [ "${PCT}" -ge 60 ]; then
+          elif [ "${PCT_INT}" -ge 60 ]; then
             COLOR="yellow"
           else
             COLOR="red"
           fi
+          PCT="${PCT_RAW}"
           curl -fsSL \
             "https://img.shields.io/badge/coverage-${PCT}%25-${COLOR}" \
             -o /tmp/coverage.svg
