@@ -207,12 +207,20 @@ class AppController(NSObject):
         )
         self._window.setTitle_("MacroFlow")
         self._window.setReleasedWhenClosed_(False)
-        # Enable Cmd+F (View → Toggle Full Screen). Without
-        # NSWindowCollectionBehaviorFullScreenPrimary the AppKit selector
-        # toggleFullScreen: is a no-op and the menu item stays disabled.
+        # Window collection behavior:
+        #   bit 7 (1 << 7) = FullScreenPrimary  — required for Cmd+F /
+        #     View → Toggle Full Screen to work. Without it the AppKit
+        #     selector toggleFullScreen: is a no-op.
+        #   bit 1 (1 << 1) = MoveToActiveSpace  — when the user switches
+        #     Spaces, MacroFlow's window follows them. Fixes the macOS 15
+        #     "app says it's running in the Dock but the window vanished"
+        #     symptom that happens when the window gets stranded on a
+        #     Space the user is no longer viewing.
         try:
             current_behavior = int(self._window.collectionBehavior())
-            self._window.setCollectionBehavior_(current_behavior | (1 << 7))
+            self._window.setCollectionBehavior_(
+                current_behavior | (1 << 7) | (1 << 1),
+            )
         except Exception:
             pass
         self._window.setBackgroundColor_(
@@ -1857,6 +1865,67 @@ class _AppDelegate(NSObject):
         # Don't quit when an editor (or settings/about) is closed while
         # the main window happens to be hidden. The user quits via Cmd+Q.
         return False
+
+    # ── Window restoration on macOS 15 ────────────────────────────────
+    # macOS 15 occasionally orphans the main window: app stays running in
+    # the Dock but the window is invisible (idle App Nap, Spaces switch,
+    # monitor disconnect leaving the window at off-screen coordinates,
+    # etc.). These two hooks pull the window back on Dock-icon click and
+    # on app activation — and recenter it on the main visible screen if
+    # its saved frame falls off the connected display arrangement.
+    def applicationShouldHandleReopen_hasVisibleWindows_(  # NOQA: N802
+        self, app, has_visible,
+    ):
+        if not has_visible:
+            self._restore_main_window()
+        return True
+
+    def applicationDidBecomeActive_(self, notif):  # NOQA: N802
+        # Defensive: Cmd+Tab back into MacroFlow should always show a
+        # visible window. If main window is hidden, bring it back.
+        try:
+            if (_APP_CONTROLLER is not None
+                    and _APP_CONTROLLER._window is not None
+                    and not _APP_CONTROLLER._window.isVisible()):
+                self._restore_main_window()
+        except Exception:
+            pass
+
+    def _restore_main_window(self):
+        if _APP_CONTROLLER is None or _APP_CONTROLLER._window is None:
+            return
+        win = _APP_CONTROLLER._window
+        try:
+            # If the saved frame is off-screen (monitor disconnected since
+            # last session), recenter on the main screen so the window
+            # actually shows up where the user can see it.
+            from AppKit import NSScreen
+            frame = win.frame()
+            on_visible = False
+            for scr in NSScreen.screens() or []:
+                vf = scr.visibleFrame()
+                if (frame.origin.x + frame.size.width > vf.origin.x
+                        and frame.origin.x < vf.origin.x + vf.size.width
+                        and frame.origin.y + frame.size.height > vf.origin.y
+                        and frame.origin.y < vf.origin.y + vf.size.height):
+                    on_visible = True
+                    break
+            if not on_visible:
+                win.center()
+        except Exception:
+            pass
+        try:
+            win.deminiaturize_(None)
+        except Exception:
+            pass
+        try:
+            win.makeKeyAndOrderFront_(None)
+        except Exception:
+            pass
+        try:
+            NSApp.activateIgnoringOtherApps_(True)
+        except Exception:
+            pass
 
     # ── Copy / Paste of macros via the standard Edit menu ──────────────
     # Cmd+C / Cmd+V land here only when no NSText* first responder claims
