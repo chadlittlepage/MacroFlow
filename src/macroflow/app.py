@@ -25,6 +25,7 @@ from AppKit import (
     NSEventModifierFlagCommand,
     NSEventModifierFlagControl,
     NSEventModifierFlagOption,
+    NSEventModifierFlagShift,
     NSFont,
     NSMakeRect,
     NSMenu,
@@ -64,6 +65,33 @@ except ImportError:  # pragma: no cover — only fires on broken installs
     CGColorCreateGenericRGB = None
 
 _DEFAULT_MACRO_COLOR = Macro.__dataclass_fields__["color"].default
+
+
+class _MacroCellButton(NSButton):
+    """NSButton subclass that forwards right-clicks to its target.
+
+    Default NSButton behavior fires the action only on left-mouse-down. We
+    want right-click to open the macro editor for that cell, so we override
+    rightMouseDown_ and call back to the AppController via a known method.
+    """
+
+    def rightMouseDown_(self, event):  # noqa: N802 (Cocoa accessor)
+        target = self.target()
+        if target is not None and hasattr(target, "cellRightClicked_"):
+            target.cellRightClicked_(self)
+        else:
+            # Fall back to default behavior so we don't swallow the event.
+            super().rightMouseDown_(event)
+
+# Glyphs displayed on the cell in front of the hotkey letter when the macro
+# requires a modifier. Mirrors the standard macOS menu shortcuts.
+_MODIFIER_GLYPH = {
+    "":      "",
+    "Cmd":   "⌘",
+    "Ctrl":  "⌃",
+    "Opt":   "⌥",
+    "Shift": "⇧",
+}
 _WHITE_CGCOLOR = (CGColorCreateGenericRGB(1.0, 1.0, 1.0, 1.0)
                   if CGColorCreateGenericRGB is not None else None)
 
@@ -106,11 +134,34 @@ class AppController(NSObject):
         self._cell_buttons: dict = {}
         self._title_layers: dict = {}   # (row, col) -> CATextLayer
         self._hotkey_layers: dict = {}  # (row, col) -> CATextLayer
+        # App-level undo / redo stacks. Each entry is a tuple
+        #   (label, undo_callable, redo_callable_or_None)
+        # New actions clear the redo stack — same convention as macOS apps.
+        self._undo_stack: list = []
+        self._redo_stack: list = []
+        self._undo_max = 50
+        # Set True while perform_undo/perform_redo runs; push_undo skips
+        # while it's set so undo callables don't re-record themselves.
+        self._in_undo = False
         videohub.set_mock_mode(self._store.grid.mock_videohub)
+        videohub.set_enabled(self._store.grid.videohub_enabled)
         # Init the VHC notification bridge on the main thread before any
-        # macro fire (which runs on a worker thread) can use it.
+        # macro fire (which runs on a worker thread) can use it. Even when
+        # videohub is disabled at startup, the bridge stays available so a
+        # later toggle-on works without restarting the app.
         videohub.init_bridge()
+        # Snapshot the Resolve project state (track enable + transforms) so
+        # we can restore it on quit. Captured in a worker thread so a slow
+        # Fusion bridge doesn't hold up the main window.
+        self._initial_resolve_state: dict | None = None
+        self._capture_initial_resolve_state_async()
+        self._global_key_monitor = None
         self._build_window()
+        # Apply persisted window/hotkey behaviors after the window exists.
+        if self._store.grid.keep_on_top:
+            self._apply_keep_on_top(True)
+        if self._store.grid.global_hotkeys:
+            self._apply_global_hotkeys(True)
         return self
 
     # -- Window ---------------------------------------------------------------
@@ -212,38 +263,12 @@ class AppController(NSObject):
         # Status bar — connection dots for Videohub Controller + Resolve.
         # Sits directly below the LCD, where the diagnostics panel used to be.
         bar_y = win_h - LCD_HEIGHT - STATUS_BAR_HEIGHT - 6
-        self._vh_dot = NSView.alloc().initWithFrame_(
-            NSMakeRect(GRID_PADDING, bar_y + (STATUS_BAR_HEIGHT - DOT_DIAMETER) / 2,
-                       DOT_DIAMETER, DOT_DIAMETER),
-        )
-        self._vh_dot.setWantsLayer_(True)
-        if self._vh_dot.layer() is not None:
-            self._vh_dot.layer().setCornerRadius_(DOT_DIAMETER / 2)
-            self._vh_dot.layer().setMasksToBounds_(True)
-        content.addSubview_(self._vh_dot)
-
+        # DAVINCI RESOLVE first (left-most) so it stays left-justified when
+        # the Videohub indicator is hidden via Settings.
         label_h = 16
         label_y = bar_y + (STATUS_BAR_HEIGHT - label_h) / 2
-        vh_label = NSTextField.alloc().initWithFrame_(
-            NSMakeRect(GRID_PADDING + DOT_DIAMETER + 6, label_y, 110, label_h),
-        )
-        vh_label.setBezeled_(False)
-        vh_label.setBordered_(False)
-        vh_label.setDrawsBackground_(False)
-        vh_label.setEditable_(False)
-        vh_label.setSelectable_(False)
-        vh_label.setStringValue_("VIDEOHUB")
-        vh_label.setFont_(NSFont.boldSystemFontOfSize_(12))
-        vh_label.setTextColor_(
-            NSColor.colorWithCalibratedRed_green_blue_alpha_(*TEXT_DIM),
-        )
-        if vh_label.cell() is not None:
-            vh_label.cell().setUsesSingleLineMode_(True)
-        content.addSubview_(vh_label)
-
-        rv_x = GRID_PADDING + DOT_DIAMETER + 6 + 120
         self._rv_dot = NSView.alloc().initWithFrame_(
-            NSMakeRect(rv_x, bar_y + (STATUS_BAR_HEIGHT - DOT_DIAMETER) / 2,
+            NSMakeRect(GRID_PADDING, bar_y + (STATUS_BAR_HEIGHT - DOT_DIAMETER) / 2,
                        DOT_DIAMETER, DOT_DIAMETER),
         )
         self._rv_dot.setWantsLayer_(True)
@@ -253,7 +278,7 @@ class AppController(NSObject):
         content.addSubview_(self._rv_dot)
 
         rv_label = NSTextField.alloc().initWithFrame_(
-            NSMakeRect(rv_x + DOT_DIAMETER + 6, label_y, 180, label_h),
+            NSMakeRect(GRID_PADDING + DOT_DIAMETER + 6, label_y, 130, label_h),
         )
         rv_label.setBezeled_(False)
         rv_label.setBordered_(False)
@@ -269,6 +294,77 @@ class AppController(NSObject):
             rv_label.cell().setUsesSingleLineMode_(True)
         content.addSubview_(rv_label)
 
+        vh_x = GRID_PADDING + DOT_DIAMETER + 6 + 140
+        self._vh_dot = NSView.alloc().initWithFrame_(
+            NSMakeRect(vh_x, bar_y + (STATUS_BAR_HEIGHT - DOT_DIAMETER) / 2,
+                       DOT_DIAMETER, DOT_DIAMETER),
+        )
+        self._vh_dot.setWantsLayer_(True)
+        if self._vh_dot.layer() is not None:
+            self._vh_dot.layer().setCornerRadius_(DOT_DIAMETER / 2)
+            self._vh_dot.layer().setMasksToBounds_(True)
+        content.addSubview_(self._vh_dot)
+
+        vh_label = NSTextField.alloc().initWithFrame_(
+            NSMakeRect(vh_x + DOT_DIAMETER + 6, label_y, 76, label_h),
+        )
+        vh_label.setBezeled_(False)
+        vh_label.setBordered_(False)
+        vh_label.setDrawsBackground_(False)
+        vh_label.setEditable_(False)
+        vh_label.setSelectable_(False)
+        vh_label.setStringValue_("VIDEOHUB")
+        vh_label.setFont_(NSFont.boldSystemFontOfSize_(12))
+        vh_label.setTextColor_(
+            NSColor.colorWithCalibratedRed_green_blue_alpha_(*TEXT_DIM),
+        )
+        if vh_label.cell() is not None:
+            vh_label.cell().setUsesSingleLineMode_(True)
+        content.addSubview_(vh_label)
+
+        # Preset row — popup + Save + Delete on the right of the status bar,
+        # styled like Videohub Controller's preset chooser. Pinned to the
+        # right edge so a wider window leaves the buttons in place.
+        BTN_W = 64
+        BTN_H = 24
+        POPUP_W = 200
+        right_edge = win_w - GRID_PADDING
+        row_y = bar_y + (STATUS_BAR_HEIGHT - BTN_H) / 2
+        del_x = right_edge - BTN_W
+        save_x = del_x - BTN_W - 6
+        popup_x = save_x - POPUP_W - 6
+        from AppKit import NSPopUpButton
+        self._preset_popup = NSPopUpButton.alloc().initWithFrame_(
+            NSMakeRect(popup_x, row_y, POPUP_W, BTN_H),
+        )
+        self._preset_popup.setTarget_(self)
+        self._preset_popup.setAction_("presetChanged:")
+        # Stick to right edge AND top edge (NSViewMinXMargin | NSViewMinYMargin)
+        # so the row stays put when the window resizes in either axis.
+        self._preset_popup.setAutoresizingMask_(1 | 8)
+        content.addSubview_(self._preset_popup)
+        save_btn = NSButton.alloc().initWithFrame_(
+            NSMakeRect(save_x, row_y, BTN_W, BTN_H),
+        )
+        save_btn.setTitle_("Save")
+        save_btn.setBezelStyle_(1)
+        save_btn.setTarget_(self)
+        save_btn.setAction_("presetSave:")
+        save_btn.setAutoresizingMask_(1 | 8)
+        content.addSubview_(save_btn)
+        del_btn = NSButton.alloc().initWithFrame_(
+            NSMakeRect(del_x, row_y, BTN_W, BTN_H),
+        )
+        del_btn.setTitle_("Delete")
+        del_btn.setBezelStyle_(1)
+        del_btn.setTarget_(self)
+        del_btn.setAction_("presetDelete:")
+        del_btn.setAutoresizingMask_(1 | 8)
+        content.addSubview_(del_btn)
+        self._preset_save_btn = save_btn
+        self._preset_delete_btn = del_btn
+        self._refresh_preset_popup()
+
         # Initial status check + periodic refresh.
         self._set_status_dot(self._vh_dot, False)
         self._set_status_dot(self._rv_dot, False)
@@ -280,45 +376,23 @@ class AppController(NSObject):
             for c in range(cols):
                 x = GRID_PADDING + c * (cell_w + CELL_PADDING)
                 y = grid_top - (r + 1) * cell_h - r * CELL_PADDING - CELL_PADDING
-                btn = NSButton.alloc().initWithFrame_(
-                    NSMakeRect(x, y, cell_w, cell_h),
-                )
-                # Borderless + layer-backed so the macro's color paints
-                # regardless of focus (setBezelColor reverts on focus loss).
-                btn.setBordered_(False)
-                btn.setWantsLayer_(True)
-                layer = btn.layer()
-                if layer is not None:
-                    layer.setCornerRadius_(8.0)
-                    layer.setMasksToBounds_(True)
-                tag = r * cols + c
-                btn.setTag_(tag)
-                btn.setTarget_(self)
-                btn.setAction_("cellClicked:")
-                cell = btn.cell()
-                if cell is not None:
-                    cell.setLineBreakMode_(0)  # NSLineBreakByWordWrapping
-                    cell.setWraps_(True)
-                # Tracking area: mouseEntered/mouseExited fire on hover so
-                # the LCD can show this macro's description.
-                opts = (NSTrackingMouseEnteredAndExited
-                        | NSTrackingActiveInKeyWindow
-                        | NSTrackingInVisibleRect)
-                ta = NSTrackingArea.alloc().initWithRect_options_owner_userInfo_(
-                    btn.bounds(), opts, self,
-                    {"tag": str(tag)},
-                )
-                btn.addTrackingArea_(ta)
-                content.addSubview_(btn)
-                self._cell_buttons[(r, c)] = btn
+                self._build_cell(content, r, c, cols,
+                                 NSMakeRect(x, y, cell_w, cell_h))
         self._refresh_cell_titles()
         self._apply_font_sizes()
 
         # Pin a minimum window size so cells stay usable, then subscribe to
         # NSWindowDidResize so cells/LCD/status bar reflow when the user
         # drags the corner.
-        min_w = GRID_PADDING * 2 + cols * 80 + (cols - 1) * CELL_PADDING
-        min_h = GRID_PADDING * 2 + rows * 60 + (rows - 1) * CELL_PADDING + top_strip
+        min_cell_w = 80 if cols <= 12 else 30
+        min_cell_h = 60 if rows <= 12 else 24
+        # Floor at the size needed to fit the LCD + status row + preset row
+        # without anything overlapping or clipping (≈720×520 for a 4×4).
+        min_w = max(720,
+                    GRID_PADDING * 2 + cols * min_cell_w + (cols - 1) * CELL_PADDING)
+        min_h = max(520,
+                    GRID_PADDING * 2 + rows * min_cell_h
+                    + (rows - 1) * CELL_PADDING + top_strip)
         self._window.setMinSize_((min_w, min_h))
         self._lcd_wrap = lcd_wrap
         self._status_views = {
@@ -327,6 +401,8 @@ class AppController(NSObject):
             "rv_dot": self._rv_dot,
             "rv_label": rv_label,
         }
+        # Honor the saved videohub_enabled flag for the initial paint.
+        self._apply_videohub_visibility()
         from Foundation import NSNotificationCenter
         NSNotificationCenter.defaultCenter().addObserver_selector_name_object_(
             self, "windowDidResize:", "NSWindowDidResizeNotification",
@@ -350,24 +426,33 @@ class AppController(NSObject):
 
     @objc.python_method
     def _refresh_status_dots(self) -> None:
-        """Background-thread probe of both backends; main-thread dot update."""
+        """Background-thread probe of both backends; main-thread dot update.
+
+        Resolve: round-trips a GetProjectManager() call so a stale cached
+        handle (Resolve was running, then quit) shows red.
+        Videohub: TCP-probes the saved router IP(s) from VHC's config. Was
+        previously hitting 127.0.0.1:9990 which is the Blackmagic Videohub
+        Daemon — that's a system service that's almost always running and
+        has nothing to do with whether the actual router (or VHC) is up.
+        """
+        videohub_on = bool(self._store.grid.videohub_enabled)
+
         def _probe() -> None:
-            import socket
             vh_ok = False
+            if videohub_on:
+                try:
+                    vh_ok = bool(videohub.is_alive())
+                except Exception:
+                    vh_ok = False
             try:
-                with socket.create_connection(("127.0.0.1", 9990), timeout=0.5):
-                    vh_ok = True
-            except OSError:
-                vh_ok = False
-            try:
-                rv_ok = bool(resolve.connect())
+                rv_ok = bool(resolve.is_alive())
             except Exception:
                 rv_ok = False
 
             def _apply() -> None:
-                self._set_status_dot(self._vh_dot, vh_ok)
+                if videohub_on:
+                    self._set_status_dot(self._vh_dot, vh_ok)
                 self._set_status_dot(self._rv_dot, rv_ok)
-                # Re-arm the probe in 5 seconds.
                 from PyObjCTools import AppHelper as _ah
                 _ah.callLater(5.0, self._refresh_status_dots)
 
@@ -376,17 +461,334 @@ class AppController(NSObject):
         threading.Thread(target=_probe, daemon=True).start()
 
     @objc.python_method
+    def _apply_videohub_visibility(self) -> None:
+        """Show / hide the VIDEOHUB status dot + label per the master switch."""
+        on = bool(self._store.grid.videohub_enabled)
+        try:
+            self._vh_dot.setHidden_(not on)
+        except Exception:
+            pass
+        vh_label = self._status_views.get("vh_label") if hasattr(self, "_status_views") else None
+        if vh_label is not None:
+            try:
+                vh_label.setHidden_(not on)
+            except Exception:
+                pass
+
+    # -- Undo / redo ----------------------------------------------------------
+
+    # -- Resolve project capture / restore ------------------------------------
+
+    @objc.python_method
+    def _capture_initial_resolve_state_async(self) -> None:
+        def _run():
+            try:
+                info = resolve.safe_get_video_track_info() or []
+                xforms = resolve.safe_get_video_track_transforms() or {}
+            except Exception as e:
+                print(f"[macroflow] capture initial Resolve state failed: {e}")
+                return
+            if not info and not xforms:
+                return
+            snap = {
+                "tracks": {int(i["index"]): bool(i["enabled"]) for i in info},
+                "transforms": {int(k): dict(v) for k, v in xforms.items()},
+            }
+            self._initial_resolve_state = snap
+            print(
+                f"[macroflow] captured initial Resolve state — "
+                f"{len(snap['tracks'])} tracks, "
+                f"{len(snap['transforms'])} transforms",
+            )
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    @objc.python_method
+    def restore_initial_resolve_state(self) -> None:
+        """Push the captured-on-launch Resolve state back, restoring track
+        enable flags + transforms. Called from applicationWillTerminate_."""
+        snap = getattr(self, "_initial_resolve_state", None)
+        if not snap:
+            return
+        print("[macroflow] restoring initial Resolve project state")
+        try:
+            if snap.get("tracks"):
+                resolve.safe_apply_track_state(snap["tracks"])
+        except Exception as e:
+            print(f"[macroflow] restore tracks failed: {e}")
+        try:
+            if snap.get("transforms"):
+                resolve.safe_apply_video_track_transforms(snap["transforms"])
+        except Exception as e:
+            print(f"[macroflow] restore transforms failed: {e}")
+
+    # -- Undo / redo ----------------------------------------------------------
+
+    @objc.python_method
+    def push_undo(self, label: str, undo_fn, redo_fn=None) -> None:
+        """Record an undoable action. `undo_fn` reverts; `redo_fn` re-applies
+        (optional — without it, a redo isn't offered after an undo)."""
+        if self._in_undo:
+            return  # Don't record anything while we're already undoing/redoing
+        self._undo_stack.append((label, undo_fn, redo_fn))
+        self._redo_stack.clear()
+        if len(self._undo_stack) > self._undo_max:
+            self._undo_stack.pop(0)
+
+    @objc.python_method
+    def perform_undo(self) -> None:
+        if not self._undo_stack:
+            try:
+                self._lcd.setStringValue_("Nothing to undo")
+            except Exception:
+                pass
+            return
+        label, undo_fn, redo_fn = self._undo_stack.pop()
+        self._in_undo = True
+        try:
+            undo_fn()
+        except Exception as e:
+            print(f"[undo] '{label}' failed: {e}")
+        finally:
+            self._in_undo = False
+        try:
+            self._lcd.setStringValue_(f"Undid: {label}")
+        except Exception:
+            pass
+        if redo_fn is not None:
+            self._redo_stack.append((label, undo_fn, redo_fn))
+
+    @objc.python_method
+    def perform_redo(self) -> None:
+        if not self._redo_stack:
+            try:
+                self._lcd.setStringValue_("Nothing to redo")
+            except Exception:
+                pass
+            return
+        label, undo_fn, redo_fn = self._redo_stack.pop()
+        self._in_undo = True
+        try:
+            if redo_fn is not None:
+                redo_fn()
+        except Exception as e:
+            print(f"[redo] '{label}' failed: {e}")
+        finally:
+            self._in_undo = False
+        try:
+            self._lcd.setStringValue_(f"Redid: {label}")
+        except Exception:
+            pass
+        self._undo_stack.append((label, undo_fn, redo_fn))
+
+    @objc.python_method
+    def set_videohub_enabled(self, enabled: bool) -> None:
+        """Toggle the Videohub backend at runtime (called from Settings)."""
+        prev = bool(self._store.grid.videohub_enabled)
+        enabled = bool(enabled)
+        if prev == enabled:
+            return
+        self._store.grid.videohub_enabled = enabled
+        videohub.set_enabled(enabled)
+        self._apply_videohub_visibility()
+        # Re-mark presets that include Videohub actions so the user sees
+        # which ones are partially neutered by the new state.
+        try:
+            self._refresh_preset_popup()
+        except Exception:
+            pass
+        self._store.save()
+        self.push_undo(
+            f"Videohub backend {'on' if enabled else 'off'}",
+            lambda: self.set_videohub_enabled(prev),
+            lambda: self.set_videohub_enabled(enabled),
+        )
+
+    # -- Keep on Top + Global Hotkeys (Settings → Window & Hotkey Behavior) --
+
+    @objc.python_method
+    def _apply_keep_on_top(self, on: bool) -> None:
+        from AppKit import NSFloatingWindowLevel, NSNormalWindowLevel
+        try:
+            self._window.setLevel_(
+                NSFloatingWindowLevel if on else NSNormalWindowLevel,
+            )
+            print(f"[settings] Keep on Top: {'ON' if on else 'OFF'}")
+        except Exception as e:
+            print(f"[settings] keep-on-top failed: {e}")
+
+    @objc.python_method
+    def set_keep_on_top(self, on: bool) -> None:
+        self._store.grid.keep_on_top = bool(on)
+        self._apply_keep_on_top(bool(on))
+        self._store.save()
+
+    @objc.python_method
+    def _is_accessibility_trusted(self) -> bool:
+        try:
+            import ctypes
+            cf = ctypes.cdll.LoadLibrary(
+                "/System/Library/Frameworks/ApplicationServices.framework/"
+                "ApplicationServices",
+            )
+            cf.AXIsProcessTrusted.restype = ctypes.c_bool
+            return bool(cf.AXIsProcessTrusted())
+        except Exception:
+            return True  # if we can't check, assume yes
+
+    @objc.python_method
+    def _prompt_accessibility(self) -> bool:
+        """Show the 'enable in Accessibility' alert. Returns True if user
+        clicked Open Settings (we then can't actually verify until next
+        toggle attempt), False otherwise."""
+        from AppKit import NSAlert, NSAlertFirstButtonReturn, NSAppearance
+        import subprocess
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_("Accessibility Permission Required")
+        alert.setInformativeText_(
+            "Global Hotkeys need Accessibility permission to capture "
+            "keystrokes when MacroFlow is in the background.\n\n"
+            "Click Open Settings, enable MacroFlow in the Accessibility "
+            "list, then re-tick Global Hotkeys.",
+        )
+        alert.addButtonWithTitle_("Open Settings")
+        alert.addButtonWithTitle_("Not Now")
+        try:
+            dark = NSAppearance.appearanceNamed_("NSAppearanceNameDarkAqua")
+            if dark:
+                alert.window().setAppearance_(dark)
+        except Exception:
+            pass
+        if int(alert.runModal()) == NSAlertFirstButtonReturn:
+            subprocess.Popen([
+                "open",
+                "x-apple.systempreferences:com.apple.preference.security?"
+                "Privacy_Accessibility",
+            ])
+            return True
+        return False
+
+    @objc.python_method
+    def _apply_global_hotkeys(self, on: bool) -> None:
+        # Tear down any existing monitor first.
+        if self._global_key_monitor is not None:
+            try:
+                NSEvent.removeMonitor_(self._global_key_monitor)
+            except Exception:
+                pass
+            self._global_key_monitor = None
+            print("[hotkeys] global monitor removed")
+        if not on:
+            return
+        if not self._is_accessibility_trusted():
+            self._prompt_accessibility()
+            # Save flag false — user has to re-tick after granting permission.
+            self._store.grid.global_hotkeys = False
+            self._store.save()
+            return
+
+        def _global_handler(event):
+            try:
+                self._handle_global_hotkey_event(event)
+            except Exception as e:
+                print(f"[hotkeys] global handler: {e}")
+
+        self._global_key_monitor = (
+            NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
+                NSEventMaskKeyDown, _global_handler,
+            )
+        )
+        print("[hotkeys] global monitor installed")
+
+    @objc.python_method
+    def _handle_global_hotkey_event(self, event) -> None:
+        """Match the event against macro hotkeys (same logic as the local
+        monitor, minus arrow nav / text-edit suppression). Fires on the main
+        thread via AppHelper.callAfter."""
+        capture_mask = (
+            NSEventModifierFlagCommand
+            | NSEventModifierFlagControl
+            | NSEventModifierFlagOption
+            | NSEventModifierFlagShift
+        )
+        mod_to_flag = {
+            "Cmd":   int(NSEventModifierFlagCommand),
+            "Ctrl":  int(NSEventModifierFlagControl),
+            "Opt":   int(NSEventModifierFlagOption),
+            "Shift": int(NSEventModifierFlagShift),
+        }
+        event_mods = int(event.modifierFlags()) & int(capture_mask)
+        keycode = int(event.keyCode())
+        if keycode in _FN_KEYCODES:
+            key = _FN_KEYCODES[keycode]
+        else:
+            chars = event.charactersIgnoringModifiers() or ""
+            if not chars:
+                return
+            key = str(chars)[0].lower()
+        rows = self._store.grid.rows
+        cols = self._store.grid.cols
+        for macro in self._store.grid.macros.values():
+            if not macro.hotkey or macro.hotkey != key:
+                continue
+            required = mod_to_flag.get(
+                getattr(macro, "hotkey_modifier", "") or "", 0,
+            )
+            if event_mods != required:
+                continue
+            try:
+                r, c = (int(x) for x in macro.id.split(","))
+            except ValueError:
+                continue
+            if r >= rows or c >= cols:
+                continue
+            print(f"[hotkeys] (global) '{key}' -> firing {macro.id}")
+            AppHelper.callAfter(self._fire, r, c)
+            return
+
+    @objc.python_method
+    def set_global_hotkeys(self, on: bool) -> None:
+        on = bool(on)
+        self._store.grid.global_hotkeys = on
+        self._apply_global_hotkeys(on)
+        # _apply_global_hotkeys may flip the flag back to False if perm denied.
+        self._store.save()
+
+    @objc.python_method
     def _install_hotkey_monitor(self) -> None:
-        """Local monitor: when MacroFlow is the focused app, single-key
-        presses (no modifiers other than Shift) fire the matching macro."""
+        """Local monitor: when MacroFlow is the focused app, key presses fire
+        the matching macro. Each macro can require a specific modifier
+        (Cmd/Ctrl/Opt/Shift) — only events with EXACTLY that modifier active
+        will fire. Macros with no modifier fire only on bare keypresses."""
+        # Subset of modifiers we care about for matching.
+        capture_mask = (
+            NSEventModifierFlagCommand
+            | NSEventModifierFlagControl
+            | NSEventModifierFlagOption
+            | NSEventModifierFlagShift
+        )
+        mod_to_flag = {
+            "Cmd":   int(NSEventModifierFlagCommand),
+            "Ctrl":  int(NSEventModifierFlagControl),
+            "Opt":   int(NSEventModifierFlagOption),
+            "Shift": int(NSEventModifierFlagShift),
+        }
+
         def _handler(event):
-            mods = int(event.modifierFlags())
-            # Ignore presses combined with Cmd/Ctrl/Option — let the system
-            # have those for shortcuts. Plain key (or Shift+key) fires.
-            if mods & (NSEventModifierFlagCommand
-                       | NSEventModifierFlagControl
-                       | NSEventModifierFlagOption):
-                return event
+            # Don't fire macros while the user is typing into a text field
+            # (label / Settings sliders / transform fields / preset name).
+            # The field editor for any NSTextField becomes the first responder
+            # while editing, and it inherits from NSText.
+            try:
+                from AppKit import NSText
+                key_window = NSApp.keyWindow()
+                if key_window is not None:
+                    fr = key_window.firstResponder()
+                    if fr is not None and fr.isKindOfClass_(NSText):
+                        return event  # let the field consume the keystroke
+            except Exception:
+                pass
+            event_mods = int(event.modifierFlags()) & int(capture_mask)
             keycode = int(event.keyCode())
             if keycode in _FN_KEYCODES:
                 key = _FN_KEYCODES[keycode]
@@ -394,13 +796,55 @@ class AppController(NSObject):
                 chars = event.charactersIgnoringModifiers() or ""
                 if not chars:
                     return event
+                # Grid keyboard nav — only when the main grid window is the
+                # key window (so the editor's track table can still own Up/
+                # Down/Left/Right/Enter when it's focused).
+                if event_mods == 0 and NSApp.keyWindow() is self._window:
+                    code = ord(chars[0])
+                    arrow_map = {
+                        0xF700: (-1, 0),  # up
+                        0xF701: (+1, 0),  # down
+                        0xF702: (0, -1),  # left
+                        0xF703: (0, +1),  # right
+                    }
+                    if code in arrow_map:
+                        dr, dc = arrow_map[code]
+                        self._move_grid_selection(dr, dc)
+                        return None  # consume
+                    if chars in ("\r", "\n", "\x03"):
+                        sel = getattr(self, "_selected_fire_key", None)
+                        if sel is None:
+                            sel = (0, 0)
+                        r, c = sel
+                        if (r < self._store.grid.rows
+                                and c < self._store.grid.cols):
+                            self._fire(r, c)
+                            return None
                 key = str(chars)[0].lower()
+            grid_rows = self._store.grid.rows
+            grid_cols = self._store.grid.cols
             for macro in self._store.grid.macros.values():
-                if macro.hotkey and macro.hotkey == key:
-                    print(f"[hotkey] '{key}' -> firing {macro.id}")
+                if not macro.hotkey or macro.hotkey != key:
+                    continue
+                required = mod_to_flag.get(
+                    getattr(macro, "hotkey_modifier", "") or "", 0,
+                )
+                # Exact-match on the modifier set: empty modifier requires
+                # zero modifier flags; named modifier requires only that one.
+                if event_mods != required:
+                    continue
+                try:
                     r, c = (int(x) for x in macro.id.split(","))
-                    self._fire(r, c)
-                    return None  # consume the event
+                except ValueError:
+                    continue
+                # Skip macros that fell outside the grid after a resize —
+                # they're still in the store but no longer visible/clickable.
+                if r >= grid_rows or c >= grid_cols:
+                    continue
+                mod_label = getattr(macro, "hotkey_modifier", "") or "none"
+                print(f"[hotkey] '{key}' (mod={mod_label}) -> firing {macro.id}")
+                self._fire(r, c)
+                return None  # consume the event
             return event
 
         try:
@@ -567,7 +1011,288 @@ class AppController(NSObject):
         )
         if not intentional:
             return (f"R{r+1}C{c+1}", "")
-        return (macro.label or f"R{r+1}C{c+1}", macro.hotkey or "")
+        # Prepend the modifier glyph (⌘ ⌃ ⌥ ⇧) if the macro requires one.
+        glyph = _MODIFIER_GLYPH.get(getattr(macro, "hotkey_modifier", "") or "", "")
+        hotkey_str = f"{glyph}{macro.hotkey}" if (glyph and macro.hotkey) else (macro.hotkey or "")
+        return (macro.label or f"R{r+1}C{c+1}", hotkey_str)
+
+    # -- Grid construction / resize -----------------------------------------
+
+    @objc.python_method
+    def _build_cell(self, content, r: int, c: int, cols: int, frame) -> None:
+        # Borderless + layer-backed so the macro's color paints regardless
+        # of focus (setBezelColor reverts on focus loss). Subclassed so
+        # right-click opens the editor (forwarded to cellRightClicked_).
+        btn = _MacroCellButton.alloc().initWithFrame_(frame)
+        btn.setBordered_(False)
+        btn.setWantsLayer_(True)
+        layer = btn.layer()
+        if layer is not None:
+            layer.setCornerRadius_(8.0)
+            layer.setMasksToBounds_(True)
+        tag = r * cols + c
+        btn.setTag_(tag)
+        btn.setTarget_(self)
+        btn.setAction_("cellClicked:")
+        cell = btn.cell()
+        if cell is not None:
+            cell.setLineBreakMode_(0)  # NSLineBreakByWordWrapping
+            cell.setWraps_(True)
+        opts = (NSTrackingMouseEnteredAndExited
+                | NSTrackingActiveInKeyWindow
+                | NSTrackingInVisibleRect)
+        ta = NSTrackingArea.alloc().initWithRect_options_owner_userInfo_(
+            btn.bounds(), opts, self, {"tag": str(tag)},
+        )
+        btn.addTrackingArea_(ta)
+        content.addSubview_(btn)
+        self._cell_buttons[(r, c)] = btn
+
+    @objc.python_method
+    def apply_grid_size(self, rows: int, cols: int) -> None:
+        """Live-resize the grid (e.g. 4x4 → 12x12) without restarting."""
+        if rows <= 0 or cols <= 0:
+            return
+        if (rows, cols) == (self._store.grid.rows, self._store.grid.cols):
+            return
+        prev_rows, prev_cols = self._store.grid.rows, self._store.grid.cols
+        new_rows, new_cols = int(rows), int(cols)
+        content = self._window.contentView()
+        if content is None:
+            return
+        # Tear down existing cells and their text sublayers.
+        for btn in self._cell_buttons.values():
+            try:
+                btn.removeFromSuperview()
+            except Exception:
+                pass
+        self._cell_buttons.clear()
+        self._title_layers.clear()
+        self._hotkey_layers.clear()
+        # The previously-outlined "selected" cell is gone now too.
+        self._selected_fire_key = None
+        self._store.grid.rows = int(rows)
+        self._store.grid.cols = int(cols)
+        # Rebuild cells at provisional sizes; _relayout immediately reflows.
+        cell_w, cell_h = 140.0, 100.0
+        for r in range(rows):
+            for c in range(cols):
+                self._build_cell(
+                    content, r, c, cols,
+                    NSMakeRect(0, 0, cell_w, cell_h),
+                )
+        # Tighten the window's minimum so it can't be shrunk below the new
+        # grid's usable size. Cell minimums scale down for very large grids
+        # (e.g. 40x40) so the window doesn't insist on being wider than the
+        # screen. Hard floor matches the LCD + status + preset rows.
+        min_cell_w = 80 if cols <= 12 else 30
+        min_cell_h = 60 if rows <= 12 else 24
+        min_w = max(720,
+                    GRID_PADDING * 2 + cols * min_cell_w + (cols - 1) * CELL_PADDING)
+        min_h = max(520,
+                    GRID_PADDING * 2 + rows * min_cell_h
+                    + (rows - 1) * CELL_PADDING + self._top_strip)
+        try:
+            self._window.setMinSize_((min_w, min_h))
+        except Exception:
+            pass
+        # If the current window is smaller than the new minimum, grow it.
+        frame = self._window.frame()
+        new_w = max(frame.size.width, min_w)
+        new_h = max(frame.size.height, min_h)
+        if (new_w, new_h) != (frame.size.width, frame.size.height):
+            self._window.setContentSize_((new_w, new_h))
+        self._refresh_cell_titles()
+        self._relayout()
+        self._apply_font_sizes()
+        self._store.save()
+        self.push_undo(
+            f"grid {prev_rows}×{prev_cols} → {new_rows}×{new_cols}",
+            lambda: self.apply_grid_size(prev_rows, prev_cols),
+            lambda: self.apply_grid_size(new_rows, new_cols),
+        )
+
+    # -- Presets --------------------------------------------------------------
+
+    @staticmethod
+    def _preset_uses_videohub(snap: dict) -> bool:
+        """True if any macro in the snapshot has a Videohub action set."""
+        for m in (snap.get("macros") or {}).values():
+            vh = m.get("videohub") or {}
+            if vh.get("device_id") and vh.get("preset_name"):
+                return True
+        return False
+
+    @objc.python_method
+    def _refresh_preset_popup(self) -> None:
+        if not hasattr(self, "_preset_popup"):
+            return
+        names = sorted(self._store.grid.presets.keys())
+        self._preset_popup.removeAllItems()
+        if names:
+            self._preset_popup.addItemWithTitle_("(select preset)")
+        else:
+            self._preset_popup.addItemWithTitle_("(no presets)")
+        for n in names:
+            snap = self._store.grid.presets.get(n) or {}
+            # Always mark presets that include Videohub macros so the user
+            # knows recall will turn the Videohub backend ON. Presets without
+            # the marker will turn it OFF on recall.
+            label = (f"{n}  •  uses Videohub"
+                     if self._preset_uses_videohub(snap) else n)
+            self._preset_popup.addItemWithTitle_(label)
+        self._preset_popup.selectItemAtIndex_(0)
+        try:
+            self._preset_delete_btn.setEnabled_(bool(names))
+        except Exception:
+            pass
+
+    def presetChanged_(self, sender) -> None:  # NOQA: N802
+        idx = int(sender.indexOfSelectedItem())
+        names = sorted(self._store.grid.presets.keys())
+        if idx <= 0 or idx > len(names):
+            return
+        # Look up by index — the displayed title may include a suffix
+        # ("• needs Videohub") so we can't reverse it from the title.
+        self._recall_preset(names[idx - 1])
+
+    def presetSave_(self, sender) -> None:  # NOQA: N802
+        from AppKit import (
+            NSAlert,
+            NSAlertFirstButtonReturn,
+            NSMakeRect,
+            NSTextField,
+        )
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_("Save Preset")
+        alert.setInformativeText_(
+            "Snapshot the current grid (rows, cols, all macros) as a named "
+            "preset. Saving over an existing name overwrites it.",
+        )
+        alert.addButtonWithTitle_("Save")
+        alert.addButtonWithTitle_("Cancel")
+        # Suggest an unused default name.
+        n = 1
+        while f"Preset {n}" in self._store.grid.presets:
+            n += 1
+        tf = NSTextField.alloc().initWithFrame_(NSMakeRect(0, 0, 240, 24))
+        tf.setStringValue_(f"Preset {n}")
+        alert.setAccessoryView_(tf)
+        try:
+            from AppKit import NSAppearance
+            dark = NSAppearance.appearanceNamed_("NSAppearanceNameDarkAqua")
+            if dark:
+                alert.window().setAppearance_(dark)
+        except Exception:
+            pass
+        if int(alert.runModal()) != NSAlertFirstButtonReturn:
+            return
+        name = str(tf.stringValue() or "").strip()
+        if not name:
+            return
+        self._store.grid.presets[name] = self._store.snapshot_current()
+        self._store.save()
+        self._refresh_preset_popup()
+        # Re-select the just-saved entry.
+        names = sorted(self._store.grid.presets.keys())
+        if name in names:
+            self._preset_popup.selectItemAtIndex_(names.index(name) + 1)
+        self._lcd.setStringValue_(f"Preset saved: {name}")
+
+    def presetDelete_(self, sender) -> None:  # NOQA: N802
+        from AppKit import NSAlert, NSAlertFirstButtonReturn
+        idx = int(self._preset_popup.indexOfSelectedItem())
+        names = sorted(self._store.grid.presets.keys())
+        if idx <= 0 or idx > len(names):
+            return
+        name = names[idx - 1]
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_(f"Delete preset \"{name}\"?")
+        alert.setInformativeText_("Cmd+Z restores it.")
+        alert.addButtonWithTitle_("Delete")
+        alert.addButtonWithTitle_("Cancel")
+        try:
+            from AppKit import NSAppearance
+            dark = NSAppearance.appearanceNamed_("NSAppearanceNameDarkAqua")
+            if dark:
+                alert.window().setAppearance_(dark)
+        except Exception:
+            pass
+        if int(alert.runModal()) != NSAlertFirstButtonReturn:
+            return
+        # Snapshot the preset before removal so undo can put it back.
+        prev_snap = dict(self._store.grid.presets.get(name) or {})
+        self._store.grid.presets.pop(name, None)
+        self._store.save()
+        self._refresh_preset_popup()
+        self._lcd.setStringValue_(f"Preset deleted: {name}")
+
+        def _undo():
+            self._store.grid.presets[name] = dict(prev_snap)
+            self._store.save()
+            self._refresh_preset_popup()
+
+        def _redo():
+            self._store.grid.presets.pop(name, None)
+            self._store.save()
+            self._refresh_preset_popup()
+
+        self.push_undo(f"delete preset '{name}'", _undo, _redo)
+
+    @objc.python_method
+    def _recall_preset(self, name: str) -> None:
+        snap = self._store.grid.presets.get(name)
+        if not snap:
+            return
+        # Snapshot the grid BEFORE recall so undo can put it back exactly,
+        # including the videohub_enabled state and dimensions.
+        pre_snap = {
+            "rows": self._store.grid.rows,
+            "cols": self._store.grid.cols,
+            "videohub_enabled": bool(self._store.grid.videohub_enabled),
+            "macros": {mid: m.to_dict() for mid, m in self._store.grid.macros.items()},
+        }
+        rows = int(snap.get("rows", self._store.grid.rows))
+        cols = int(snap.get("cols", self._store.grid.cols))
+        # The preset dictates the Videohub backend state. If the preset
+        # uses Videohub, we enable it. If it doesn't, we disable it. No-op
+        # when the requested state already matches.
+        needs_vh = self._preset_uses_videohub(snap)
+        if needs_vh != bool(self._store.grid.videohub_enabled):
+            self.set_videohub_enabled(needs_vh)
+        # Resize the grid first if needed (rebuilds cells).
+        if (rows, cols) != (self._store.grid.rows, self._store.grid.cols):
+            self.apply_grid_size(rows, cols)
+        # Replace the in-memory macros wholesale with the preset's snapshot.
+        self._store.grid.macros = {
+            mid: Macro.from_dict(m) for mid, m in (snap.get("macros") or {}).items()
+        }
+        self._store.save()
+        self._refresh_cell_titles()
+        suffix = " (Videohub on)" if needs_vh else " (Videohub off)"
+        self._lcd.setStringValue_(f"Recalled preset: {name}{suffix}")
+
+        def _undo():
+            # Restore videohub state, grid size, and macros from the
+            # pre-recall snapshot.
+            if (int(pre_snap["rows"]), int(pre_snap["cols"])) != (
+                self._store.grid.rows, self._store.grid.cols,
+            ):
+                self.apply_grid_size(int(pre_snap["rows"]), int(pre_snap["cols"]))
+            if bool(pre_snap["videohub_enabled"]) != bool(self._store.grid.videohub_enabled):
+                self.set_videohub_enabled(bool(pre_snap["videohub_enabled"]))
+            self._store.grid.macros = {
+                mid: Macro.from_dict(m)
+                for mid, m in (pre_snap["macros"] or {}).items()
+            }
+            self._store.save()
+            self._refresh_cell_titles()
+
+        self.push_undo(
+            f"recall preset '{name}'",
+            _undo,
+            lambda: self._recall_preset(name),
+        )
 
     # -- Cell interactions ----------------------------------------------------
 
@@ -643,18 +1368,20 @@ class AppController(NSObject):
         label_h = 16
         label_y = bar_y + (STATUS_BAR_HEIGHT - label_h) / 2
         dot_y = bar_y + (STATUS_BAR_HEIGHT - DOT_DIAMETER) / 2
-        self._status_views["vh_dot"].setFrame_(
+        # Resolve on the left, Videohub on the right (so disabling Videohub
+        # leaves Resolve still left-justified).
+        self._status_views["rv_dot"].setFrame_(
             NSMakeRect(GRID_PADDING, dot_y, DOT_DIAMETER, DOT_DIAMETER),
         )
-        self._status_views["vh_label"].setFrame_(
-            NSMakeRect(GRID_PADDING + DOT_DIAMETER + 6, label_y, 110, label_h),
-        )
-        rv_x = GRID_PADDING + DOT_DIAMETER + 6 + 120
-        self._status_views["rv_dot"].setFrame_(
-            NSMakeRect(rv_x, dot_y, DOT_DIAMETER, DOT_DIAMETER),
-        )
         self._status_views["rv_label"].setFrame_(
-            NSMakeRect(rv_x + DOT_DIAMETER + 6, label_y, 220, label_h),
+            NSMakeRect(GRID_PADDING + DOT_DIAMETER + 6, label_y, 130, label_h),
+        )
+        vh_x = GRID_PADDING + DOT_DIAMETER + 6 + 140
+        self._status_views["vh_dot"].setFrame_(
+            NSMakeRect(vh_x, dot_y, DOT_DIAMETER, DOT_DIAMETER),
+        )
+        self._status_views["vh_label"].setFrame_(
+            NSMakeRect(vh_x + DOT_DIAMETER + 6, label_y, 76, label_h),
         )
 
         # Grid cells fill the remaining area, dividing it evenly.
@@ -671,6 +1398,15 @@ class AppController(NSObject):
             hk = self._hotkey_layers.get((r, c))
             if title is not None and hk is not None:
                 self._position_text_layers(btn, title, hk)
+            # Keep the selected cell's inner 1px black ring sized to the cell.
+            if (r, c) == getattr(self, "_selected_fire_key", None):
+                ring = getattr(self, "_selection_inner_ring", None)
+                if ring is not None:
+                    try:
+                        ring.setFrame_(NSMakeRect(1.0, 1.0,
+                                                  cell_w - 2.0, cell_h - 2.0))
+                    except Exception:
+                        pass
 
     def cellClicked_(self, sender) -> None:  # NOQA: N802
         row, col = self._row_col_from_tag(int(sender.tag()))
@@ -684,8 +1420,29 @@ class AppController(NSObject):
         else:
             self._fire(row, col)
 
+    def cellRightClicked_(self, sender) -> None:  # NOQA: N802
+        # Right-click opens the editor for that cell (alongside Cmd+/Ctrl+click).
+        row, col = self._row_col_from_tag(int(sender.tag()))
+        # Mark it as the "selected" cell so Edit > Edit Macro targets it too.
+        self._flash_cell(row, col)
+        self._open_editor(row, col)
+
+    @objc.python_method
+    def edit_selected_cell(self) -> None:
+        """Open the editor for the cell the user most recently
+        fired/right-clicked. If no cell has been touched yet, default to (0,0)."""
+        sel = getattr(self, "_selected_fire_key", None)
+        if sel is None:
+            sel = (0, 0)
+        r, c = sel
+        if r < self._store.grid.rows and c < self._store.grid.cols:
+            self._open_editor(r, c)
+
     @objc.python_method
     def _fire(self, row: int, col: int) -> None:
+        # Outline the cell first — even if it's empty, the click still
+        # selects it (so subsequent Edit > Edit Macro / Cmd+E targets it).
+        self._flash_cell(row, col)
         macro = self._store.grid.get(row, col)
         if macro is None:
             self._lcd.setStringValue_(f"R{row+1}C{col+1} is empty")
@@ -697,6 +1454,91 @@ class AppController(NSObject):
             AppHelper.callAfter(self._fire_done, macro, results)
 
         threading.Thread(target=_bg, daemon=True).start()
+
+    @objc.python_method
+    def _move_grid_selection(self, dr: int, dc: int) -> None:
+        """Move the keyboard-driven selection (the white-on-black outline)
+        by (dr, dc) cells. Horizontal moves WRAP — arrowing past the right
+        edge goes to the leftmost column on the same row, and vice-versa.
+        Vertical moves clamp at the grid edges. Defaults to (0,0) if nothing
+        was selected yet."""
+        cur = getattr(self, "_selected_fire_key", None)
+        if cur is None:
+            cur = (0, 0)
+        r, c = cur
+        rows = self._store.grid.rows
+        cols = self._store.grid.cols
+        new_r = max(0, min(rows - 1, r + dr))
+        new_c = (c + dc) % cols if cols > 0 else 0
+        if (new_r, new_c) == (r, c) and getattr(self, "_selected_fire_key", None):
+            return
+        self._flash_cell(new_r, new_c)
+
+    @objc.python_method
+    def _flash_cell(self, row: int, col: int) -> None:
+        """Mark the just-fired cell as 'selected' with a two-tone outline:
+        1px 60%-white on the outside, 1px black inset 1px inward. Persists
+        until another cell is selected.
+        """
+        if CGColorCreateGenericRGB is None:
+            return
+        # Clear the prior selection's outline + drop the inner ring sublayer.
+        prev = getattr(self, "_selected_fire_key", None)
+        if prev is not None and prev != (row, col):
+            prev_btn = self._cell_buttons.get(prev)
+            if prev_btn is not None:
+                prev_layer = prev_btn.layer()
+                if prev_layer is not None:
+                    try:
+                        prev_layer.setBorderWidth_(0.0)
+                        prev_layer.setBorderColor_(None)
+                    except Exception:
+                        pass
+        inner = getattr(self, "_selection_inner_ring", None)
+        if inner is not None:
+            try:
+                inner.removeFromSuperlayer()
+            except Exception:
+                pass
+            self._selection_inner_ring = None
+
+        btn = self._cell_buttons.get((row, col))
+        if btn is None:
+            return
+        layer = btn.layer()
+        if layer is None:
+            return
+        try:
+            # Outer 1px ring at 60% white.
+            layer.setBorderWidth_(1.0)
+            layer.setBorderColor_(CGColorCreateGenericRGB(1.0, 1.0, 1.0, 0.60))
+        except Exception:
+            return
+
+        # Inner 1px black ring, inset 1px from the outer border.
+        try:
+            from Quartz import CALayer
+            ring = CALayer.layer()
+            ring.setBorderWidth_(1.0)
+            ring.setBorderColor_(CGColorCreateGenericRGB(0.0, 0.0, 0.0, 1.0))
+            b = layer.bounds()
+            ring.setFrame_(NSMakeRect(
+                1.0, 1.0,
+                float(b.size.width) - 2.0,
+                float(b.size.height) - 2.0,
+            ))
+            try:
+                ring.setCornerRadius_(max(0.0, float(layer.cornerRadius()) - 1.0))
+                ring.setMasksToBounds_(True)
+            except Exception:
+                pass
+            # Insert below the title/hotkey CATextLayers so it never covers them.
+            layer.insertSublayer_atIndex_(ring, 0)
+            self._selection_inner_ring = ring
+        except Exception:
+            pass
+
+        self._selected_fire_key = (row, col)
 
     @objc.python_method
     def _fire_done(self, macro: Macro, results: dict) -> None:
@@ -801,6 +1643,17 @@ class _AppDelegate(NSObject):
         # the main window happens to be hidden. The user quits via Cmd+Q.
         return False
 
+    def applicationWillTerminate_(self, notif):  # NOQA: N802
+        # On Cmd+Q / menu Quit, restore the DaVinci Resolve project to the
+        # state we captured when MacroFlow launched (track enable flags +
+        # per-track transforms). Each safe_apply_* call is bounded by a
+        # 5-second timeout, so worst-case quit-restore is ~10 seconds.
+        if _APP_CONTROLLER is not None:
+            try:
+                _APP_CONTROLLER.restore_initial_resolve_state()
+            except Exception as e:
+                print(f"[macroflow] quit-restore failed: {e}")
+
     def exportSettings_(self, sender):  # NOQA: N802
         if _APP_CONTROLLER is not None:
             _APP_CONTROLLER._export_settings()
@@ -822,6 +1675,23 @@ class _AppDelegate(NSObject):
     def showHelpWindow_(self, sender):  # NOQA: N802
         from macroflow.help_window import show_help_window
         show_help_window()
+
+    def undo_(self, sender):  # NOQA: N802
+        # Edit menu → Undo (Cmd+Z). NSText fields handle their own undo first
+        # via the responder chain, so we only see this when no text editor
+        # has focus (i.e., the LCD strip / cell grid).
+        if _APP_CONTROLLER is not None:
+            _APP_CONTROLLER.perform_undo()
+
+    def editMacro_(self, sender):  # NOQA: N802
+        # Edit menu → Edit Macro… opens the editor for the most recently
+        # fired / right-clicked cell (or 0,0 if nothing's been touched).
+        if _APP_CONTROLLER is not None:
+            _APP_CONTROLLER.edit_selected_cell()
+
+    def redo_(self, sender):  # NOQA: N802
+        if _APP_CONTROLLER is not None:
+            _APP_CONTROLLER.perform_redo()
 
     def showConsoleWindow_(self, sender):  # NOQA: N802
         from macroflow.console_window import show_console_window
@@ -886,6 +1756,11 @@ def _build_main_menu(app, app_name: str = "MacroFlow") -> None:
     edit_menu.addItemWithTitle_action_keyEquivalent_("Copy", "copy:", "c")
     edit_menu.addItemWithTitle_action_keyEquivalent_("Paste", "paste:", "v")
     edit_menu.addItemWithTitle_action_keyEquivalent_("Select All", "selectAll:", "a")
+    edit_menu.addItem_(NSMenuItem.separatorItem())
+    em_item = edit_menu.addItemWithTitle_action_keyEquivalent_(
+        "Edit Macro…", "editMacro:", "e",
+    )
+    em_item.setKeyEquivalentModifierMask_(1 << 20)  # Cmd
     edit_item.setSubmenu_(edit_menu)
 
     # View menu — Cmd+F toggles native macOS fullscreen, which restores the

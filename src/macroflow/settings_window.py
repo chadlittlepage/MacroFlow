@@ -21,6 +21,7 @@ from AppKit import (
     NSFont,
     NSMakeRect,
     NSObject,
+    NSPopUpButton,
     NSSlider,
     NSTextField,
     NSWindow,
@@ -38,6 +39,8 @@ TEXT_BRIGHT = (0.92, 0.92, 0.92, 1.0)
 DEFAULT_DISPLAY = 12.0
 DEFAULT_TITLE = 13.0
 DEFAULT_HOTKEY = 26.0
+
+GRID_CHOICES = [(4, 4), (6, 6), (8, 8), (10, 10), (12, 12), (20, 20), (40, 40)]
 
 
 class _SettingsController(NSObject):
@@ -74,17 +77,81 @@ class _SettingsController(NSObject):
         self.controller._apply_font_sizes()
         self.controller._store.save()
 
+    def gridSizeChanged_(self, sender):  # NOQA: N802
+        idx = int(sender.indexOfSelectedItem())
+        if idx < 0 or idx >= len(GRID_CHOICES):
+            return
+        rows, cols = GRID_CHOICES[idx]
+        self.controller.apply_grid_size(rows, cols)
+
+    def videohubToggled_(self, sender):  # NOQA: N802
+        on = bool(int(sender.state()) == 1)
+        self.controller.set_videohub_enabled(on)
+
+    def keepOnTopToggled_(self, sender):  # NOQA: N802
+        on = bool(int(sender.state()) == 1)
+        self.controller.set_keep_on_top(on)
+
+    def globalHotkeysToggled_(self, sender):  # NOQA: N802
+        on = bool(int(sender.state()) == 1)
+        self.controller.set_global_hotkeys(on)
+        # _apply_global_hotkeys may have flipped the flag back to False if
+        # the user declined the Accessibility prompt — re-sync the checkbox.
+        try:
+            sender.setState_(
+                1 if self.controller._store.grid.global_hotkeys else 0,
+            )
+        except Exception:
+            pass
+
     def resetDefaults_(self, sender):  # NOQA: N802
         grid = self.controller._store.grid
-        grid.display_font_size = DEFAULT_DISPLAY
-        grid.title_font_size = DEFAULT_TITLE
-        grid.hotkey_font_size = DEFAULT_HOTKEY
-        self.display_slider.setFloatValue_(DEFAULT_DISPLAY)
-        self.title_slider.setFloatValue_(DEFAULT_TITLE)
-        self.hotkey_slider.setFloatValue_(DEFAULT_HOTKEY)
-        self.display_label.setStringValue_(f"Display: {int(DEFAULT_DISPLAY)}pt")
-        self.title_label.setStringValue_(f"Title: {int(DEFAULT_TITLE)}pt")
-        self.hotkey_label.setStringValue_(f"Hotkey: {int(DEFAULT_HOTKEY)}pt")
+        prev = (grid.display_font_size, grid.title_font_size, grid.hotkey_font_size)
+        new = (float(DEFAULT_DISPLAY), float(DEFAULT_TITLE), float(DEFAULT_HOTKEY))
+        if prev == new:
+            return
+        self._apply_font_sizes(*new)
+
+        ctrl = self.controller
+
+        def _apply(values):
+            d, t, h = values
+            grid.display_font_size = float(d)
+            grid.title_font_size = float(t)
+            grid.hotkey_font_size = float(h)
+            try:
+                self.display_slider.setFloatValue_(float(d))
+                self.title_slider.setFloatValue_(float(t))
+                self.hotkey_slider.setFloatValue_(float(h))
+                self.display_label.setStringValue_(f"Display: {int(d)}pt")
+                self.title_label.setStringValue_(f"Title: {int(t)}pt")
+                self.hotkey_label.setStringValue_(f"Hotkey: {int(h)}pt")
+            except Exception:
+                pass
+            ctrl._apply_font_sizes()
+            ctrl._store.save()
+
+        try:
+            ctrl.push_undo(
+                "reset font sizes to defaults",
+                lambda: _apply(prev),
+                lambda: _apply(new),
+            )
+        except Exception:
+            pass
+
+    @objc.python_method
+    def _apply_font_sizes(self, display: float, title: float, hotkey: float) -> None:
+        grid = self.controller._store.grid
+        grid.display_font_size = float(display)
+        grid.title_font_size = float(title)
+        grid.hotkey_font_size = float(hotkey)
+        self.display_slider.setFloatValue_(float(display))
+        self.title_slider.setFloatValue_(float(title))
+        self.hotkey_slider.setFloatValue_(float(hotkey))
+        self.display_label.setStringValue_(f"Display: {int(display)}pt")
+        self.title_label.setStringValue_(f"Title: {int(title)}pt")
+        self.hotkey_label.setStringValue_(f"Hotkey: {int(hotkey)}pt")
         self.controller._apply_font_sizes()
         self.controller._store.save()
 
@@ -93,7 +160,7 @@ def show_settings_window(controller) -> None:
     sc = _SettingsController.alloc().init()
     sc.attach(controller)
 
-    win_w, win_h = 360, 300
+    win_w, win_h = 360, 500
     style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
     window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
         NSMakeRect(0, 0, win_w, win_h), style, NSBackingStoreBuffered, False,
@@ -149,6 +216,104 @@ def show_settings_window(controller) -> None:
     )
     sc.hotkey_label, sc.hotkey_slider = add_slider(
         win_h - 190, "Hotkey", grid.hotkey_font_size, 12, 60, "hotkeyChanged:",
+    )
+
+    # Grid size dropdown (4x4 .. 20x20). Lives below the sliders.
+    grid_row_y = win_h - 240
+    grid_label = NSTextField.alloc().initWithFrame_(
+        NSMakeRect(20, grid_row_y + 4, 100, 18),
+    )
+    grid_label.setStringValue_("Grid size:")
+    grid_label.setBezeled_(False)
+    grid_label.setDrawsBackground_(False)
+    grid_label.setEditable_(False)
+    grid_label.setSelectable_(False)
+    grid_label.setFont_(NSFont.boldSystemFontOfSize_(12))
+    grid_label.setTextColor_(
+        NSColor.colorWithCalibratedRed_green_blue_alpha_(*TEXT_BRIGHT),
+    )
+    content.addSubview_(grid_label)
+
+    grid_popup = NSPopUpButton.alloc().initWithFrame_(
+        NSMakeRect(120, grid_row_y, win_w - 140, 26),
+    )
+    for r, c in GRID_CHOICES:
+        grid_popup.addItemWithTitle_(f"{r} × {c}  ({r * c} cells)")
+    current = (grid.rows, grid.cols)
+    if current in GRID_CHOICES:
+        grid_popup.selectItemAtIndex_(GRID_CHOICES.index(current))
+    grid_popup.setTarget_(sc)
+    grid_popup.setAction_("gridSizeChanged:")
+    content.addSubview_(grid_popup)
+    sc.grid_popup = grid_popup
+
+    # Videohub master switch — when off, the app runs without any Videohub
+    # assumptions (no status probe, no recall on macro fire, no editor
+    # device list).
+    vh_y = grid_row_y - 40
+    vh_check = NSButton.alloc().initWithFrame_(
+        NSMakeRect(20, vh_y, win_w - 40, 22),
+    )
+    vh_check.setButtonType_(3)  # NSButtonTypeSwitch
+    vh_check.setTitle_("Enable Videohub backend")
+    vh_check.setState_(1 if grid.videohub_enabled else 0)
+    vh_check.setTarget_(sc)
+    vh_check.setAction_("videohubToggled:")
+    content.addSubview_(vh_check)
+    sc.videohub_check = vh_check
+
+    # Window & Hotkey Behavior section — ported from Videohub Controller.
+    sect_y = vh_y - 36
+    sect_lbl = NSTextField.alloc().initWithFrame_(
+        NSMakeRect(20, sect_y, win_w - 40, 18),
+    )
+    sect_lbl.setStringValue_("Window & Hotkey Behavior")
+    sect_lbl.setBezeled_(False)
+    sect_lbl.setDrawsBackground_(False)
+    sect_lbl.setEditable_(False)
+    sect_lbl.setSelectable_(False)
+    sect_lbl.setFont_(NSFont.boldSystemFontOfSize_(13))
+    sect_lbl.setTextColor_(
+        NSColor.colorWithCalibratedRed_green_blue_alpha_(*TEXT_BRIGHT),
+    )
+    content.addSubview_(sect_lbl)
+
+    def _add_toggle(y_pos: float, title: str, sub: str,
+                    state: bool, action: str):
+        cb = NSButton.alloc().initWithFrame_(
+            NSMakeRect(20, y_pos, win_w - 40, 22),
+        )
+        cb.setButtonType_(3)
+        cb.setTitle_(title)
+        cb.setState_(1 if state else 0)
+        cb.setTarget_(sc)
+        cb.setAction_(action)
+        content.addSubview_(cb)
+        sub_lbl = NSTextField.alloc().initWithFrame_(
+            NSMakeRect(38, y_pos - 16, win_w - 60, 14),
+        )
+        sub_lbl.setStringValue_(sub)
+        sub_lbl.setBezeled_(False)
+        sub_lbl.setDrawsBackground_(False)
+        sub_lbl.setEditable_(False)
+        sub_lbl.setSelectable_(False)
+        sub_lbl.setFont_(NSFont.systemFontOfSize_(11))
+        sub_lbl.setTextColor_(
+            NSColor.colorWithCalibratedRed_green_blue_alpha_(*TEXT_DIM),
+        )
+        content.addSubview_(sub_lbl)
+        return cb
+
+    sc.keep_on_top_check = _add_toggle(
+        sect_y - 28, "Keep on Top",
+        "Float above other apps like DaVinci Resolve",
+        grid.keep_on_top, "keepOnTopToggled:",
+    )
+    sc.global_hotkeys_check = _add_toggle(
+        sect_y - 72, "Global Hotkeys",
+        "Hotkeys fire even when MacroFlow is not focused.\n"
+        "Requires Accessibility permission.",
+        grid.global_hotkeys, "globalHotkeysToggled:",
     )
 
     # Reset to Defaults button — sits beneath the three sliders.

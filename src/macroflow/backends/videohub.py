@@ -30,6 +30,12 @@ VIDEOHUB_CONFIG = Path("/Users/Shared/Videohub Controller/videohub_controller.js
 # UI without a Videohub on the LAN.
 MOCK_MODE: bool = False
 
+# Master switch: when False the backend is fully disabled. Every public
+# entry-point (recall_preset, list_devices, list_presets) returns an empty/
+# success-no-op result without touching the LAN or VHC config. Toggled from
+# the Settings window.
+ENABLED: bool = True
+
 # After every recall_preset() call, this is updated with a record of what
 # was just applied so the GUI can display it. {device_id, preset_name,
 # routes: [(out, in), ...], endpoint: "..." | "(mock)" | None}
@@ -40,6 +46,62 @@ def set_mock_mode(enabled: bool) -> None:
     global MOCK_MODE
     MOCK_MODE = bool(enabled)
     print(f"[videohub] MOCK_MODE = {MOCK_MODE}")
+
+
+def set_enabled(enabled: bool) -> None:
+    global ENABLED
+    ENABLED = bool(enabled)
+    print(f"[videohub] ENABLED = {ENABLED}")
+
+
+def is_enabled() -> bool:
+    return ENABLED
+
+
+VHC_BUNDLE_ID = "com.chadlittlepage.videohubcontroller"
+
+
+def is_alive(timeout: float = 0.4) -> bool:
+    """True if Videohub Controller is currently running.
+
+    The router itself isn't a stable signal (no router on the LAN is
+    common during preset authoring), and 127.0.0.1:9990 probes the
+    Blackmagic Videohub Daemon (a system service, not VHC). Asking
+    NSWorkspace whether VHC's bundle is running is the truthful answer
+    the user expects — green when VHC is up, red when it's quit.
+    """
+    try:
+        from AppKit import NSWorkspace
+        for app in NSWorkspace.sharedWorkspace().runningApplications():
+            try:
+                if str(app.bundleIdentifier() or "") == VHC_BUNDLE_ID:
+                    return True
+            except Exception:
+                continue
+        return False
+    except Exception:
+        # Fallback: try TCP-connect to the saved device IPs from VHC's config.
+        cfg = load_config()
+        devices = cfg.get("devices", {}) or {}
+        candidate_ips: list[str] = []
+        last_id = cfg.get("last_device_id", "")
+        if last_id and last_id in devices:
+            ip = (devices[last_id] or {}).get("ip", "")
+            if ip:
+                candidate_ips.append(ip)
+        for uid, dev in devices.items():
+            if uid == last_id:
+                continue
+            ip = (dev or {}).get("ip", "")
+            if ip and ip not in candidate_ips:
+                candidate_ips.append(ip)
+        for ip in candidate_ips:
+            try:
+                with socket.create_connection((ip, VIDEOHUB_PORT), timeout=timeout):
+                    return True
+            except OSError:
+                continue
+        return False
 
 
 @dataclass
@@ -67,7 +129,13 @@ def load_config() -> dict:
 
 
 def list_devices() -> list[VideohubDevice]:
-    """All devices Videohub Controller has ever seen."""
+    """All devices Videohub Controller has ever seen.
+
+    Always reads the config — does NOT honor ENABLED — so the macro editor
+    can populate Device/Preset dropdowns even while the global Videohub
+    backend is toggled off in Settings. The fire-time gate at
+    recall_preset() keeps disabled macros inert.
+    """
     cfg = load_config()
     devices: list[VideohubDevice] = []
     for uid, dev in cfg.get("devices", {}).items():
@@ -83,7 +151,8 @@ def list_devices() -> list[VideohubDevice]:
 
 
 def list_presets(device_id: str) -> list[str]:
-    """Preset names saved against a given device."""
+    """Preset names saved against a given device. Always reads — see
+    list_devices() comment for why we don't gate this on ENABLED."""
     cfg = load_config()
     dev = cfg.get("devices", {}).get(device_id, {})
     return list(dev.get("presets", {}).keys())
@@ -243,6 +312,10 @@ def recall_preset(device_id: str, preset_name: str, timeout: float = 2.0) -> boo
     last_ip (if it matches), and finally the local Videohub Daemon at
     127.0.0.1. Returns True on the first successful send.
     """
+    if not ENABLED:
+        # Disabled in settings — treat as success no-op so a macro that has
+        # both Videohub and Resolve actions still fires the Resolve side.
+        return True
     cfg = load_config()
     dev = cfg.get("devices", {}).get(device_id)
     if not dev:

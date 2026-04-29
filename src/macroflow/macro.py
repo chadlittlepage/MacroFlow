@@ -19,7 +19,7 @@ import threading
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from macroflow.backends import resolve, videohub
+from macroflow.backends import local_dimming, resolve, videohub
 
 _SHARED_DIR = Path("/Users/Shared/MacroFlow")
 CONFIG_PATH = _SHARED_DIR / "macroflow.json"
@@ -44,6 +44,16 @@ class ResolveAction:
     # Per-track enable/disable: {1: True, 3: False, ...}
     # Tracks not in the dict are left untouched.
     tracks: dict[int, bool] = field(default_factory=dict)
+    # Per-track transform spec (Quadrant, Zoom X/Y, Position X/Y, Rotation,
+    # Anchor X/Y, Pitch, Yaw, Flip H/V). Editor-side feature ported from
+    # the DaVinci Script project. Stored verbatim in macroflow.json; not yet
+    # applied at fire time — that's a follow-up that needs Resolve API work.
+    track_transforms: dict[int, dict] = field(default_factory=dict)
+    # Saved-time track names, keyed by the same indices used in `tracks` and
+    # `track_transforms`. Lets the editor re-bind saved data to the right
+    # physical track after the user inserts/deletes/reorders Resolve tracks
+    # and the indices shift. Lookup-by-name has priority over lookup-by-idx.
+    track_names: dict[int, str] = field(default_factory=dict)
 
     def is_set(self) -> bool:
         return bool(self.tracks)
@@ -59,13 +69,57 @@ class ResolveAction:
 
 
 @dataclass
+class LocalDimmingAction:
+    """Push state onto the LocalDimmingSim Fusion macro on the current clip.
+
+    Each field is "leave alone" by default (None / empty / sentinel). A macro
+    with `enabled=True` and no preset just flips the bypass switch. Set
+    `preset` to swap the display class on top of toggling.
+    """
+
+    enabled: bool | None = None     # None = don't touch; True/False = set Enabled
+    quadrant: str = ""              # "" = leave; "TL"/"TR"/"BL"/"BR"/"Full"
+    preset: str = ""                # "" = leave; key from local_dimming.PRESETS
+    bloom_sigma: float | None = None
+
+    def is_set(self) -> bool:
+        return (self.enabled is not None
+                or bool(self.quadrant)
+                or bool(self.preset)
+                or self.bloom_sigma is not None)
+
+    def fire(self) -> bool:
+        if not self.is_set():
+            return True
+        state: dict = {}
+        if self.enabled is not None:
+            state["enabled"] = bool(self.enabled)
+        if self.quadrant:
+            state["quadrant"] = self.quadrant
+        if self.preset:
+            state["preset"] = self.preset
+        if self.bloom_sigma is not None:
+            state["bloom_sigma"] = float(self.bloom_sigma)
+        return local_dimming.safe_apply(state)
+
+
+@dataclass
 class Macro:
     id: str
     label: str = ""
     color: str = "#4a556c"  # primary color (CLAUDE.md global rule 001)
     hotkey: str = ""        # single character (e.g. "a", "1") or "F1"-"F12"; empty = none
+    hotkey_modifier: str = ""  # "", "Cmd", "Ctrl", "Opt", or "Shift"
+    # Per-macro Videohub include flag. Independent from the grid-wide
+    # MacroGrid.videohub_enabled toggle. When True the macro's Videohub
+    # action fires (subject to grid setting); when False the Videohub
+    # action is skipped at fire time and greyed out in the editor.
+    # Default OFF — new macros start without Videohub. The user can flip it
+    # on per-macro from the editor's "Enable" checkbox.
+    videohub_enabled: bool = False
     videohub: VideohubAction = field(default_factory=VideohubAction)
     resolve: ResolveAction = field(default_factory=ResolveAction)
+    local_dimming: LocalDimmingAction = field(default_factory=LocalDimmingAction)
 
     def fire(self) -> dict[str, bool]:
         """Run every backend action in parallel. Returns {backend: success}."""
@@ -79,7 +133,15 @@ class Macro:
                 print(f"[macro] {self.id}: {name} raised {e}")
                 results[name] = False
 
-        for name, action in (("videohub", self.videohub), ("resolve", self.resolve)):
+        for name, action in (
+            ("videohub", self.videohub),
+            ("resolve", self.resolve),
+            ("local_dimming", self.local_dimming),
+        ):
+            # Per-macro Videohub override: skip the action entirely if the
+            # editor's "Enable" checkbox for this macro is off.
+            if name == "videohub" and not self.videohub_enabled:
+                continue
             if action.is_set():
                 t = threading.Thread(target=_run, args=(name, action.fire), daemon=True)
                 t.start()
@@ -95,26 +157,59 @@ class Macro:
             "label": self.label,
             "color": self.color,
             "hotkey": self.hotkey,
+            "hotkey_modifier": self.hotkey_modifier,
+            "videohub_enabled": self.videohub_enabled,
             "videohub": asdict(self.videohub),
-            "resolve": {"tracks": {str(k): bool(v) for k, v in self.resolve.tracks.items()}},
+            "resolve": {
+                "tracks": {str(k): bool(v) for k, v in self.resolve.tracks.items()},
+                "track_transforms": {
+                    str(k): dict(v) for k, v in self.resolve.track_transforms.items()
+                },
+                "track_names": {
+                    str(k): str(v) for k, v in self.resolve.track_names.items()
+                },
+            },
+            "local_dimming": asdict(self.local_dimming),
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "Macro":
         vh_data = data.get("videohub", {}) or {}
         rv_data = data.get("resolve", {}) or {}
+        ld_data = data.get("local_dimming", {}) or {}
         tracks_raw = rv_data.get("tracks", {}) or {}
+        ld_enabled = ld_data.get("enabled", None)
         return cls(
             id=str(data.get("id", "")),
             label=str(data.get("label", "")),
             color=str(data.get("color", "#4a556c")),
             hotkey=str(data.get("hotkey", "")),
+            hotkey_modifier=str(data.get("hotkey_modifier", "")),
+            videohub_enabled=bool(data.get("videohub_enabled", True)),
             videohub=VideohubAction(
                 device_id=str(vh_data.get("device_id", "")),
                 preset_name=str(vh_data.get("preset_name", "")),
             ),
             resolve=ResolveAction(
                 tracks={int(k): bool(v) for k, v in tracks_raw.items()},
+                track_transforms={
+                    int(k): dict(v)
+                    for k, v in (rv_data.get("track_transforms") or {}).items()
+                    if isinstance(v, dict)
+                },
+                track_names={
+                    int(k): str(v)
+                    for k, v in (rv_data.get("track_names") or {}).items()
+                },
+            ),
+            local_dimming=LocalDimmingAction(
+                enabled=(None if ld_enabled is None else bool(ld_enabled)),
+                quadrant=str(ld_data.get("quadrant", "") or ""),
+                preset=str(ld_data.get("preset", "") or ""),
+                bloom_sigma=(
+                    float(ld_data["bloom_sigma"])
+                    if ld_data.get("bloom_sigma") is not None else None
+                ),
             ),
         )
 
@@ -125,6 +220,17 @@ class MacroGrid:
     cols: int = 4
     macros: dict[str, Macro] = field(default_factory=dict)  # keyed by "r,c"
     mock_videohub: bool = False
+    # Master switch for the Videohub backend. When False the app runs without
+    # any Videohub assumptions: status dot hides, hotkey/click fires don't
+    # attempt a recall, and the editor's Videohub section is disabled.
+    videohub_enabled: bool = True
+    # Window & hotkey behavior — ported from Videohub Controller's settings.
+    keep_on_top: bool = False        # NSFloatingWindowLevel when on
+    global_hotkeys: bool = False     # match macro hotkeys app-wide (needs
+                                     # Accessibility permission)
+    # Named snapshots of (rows, cols, macros). Each preset is a stand-alone
+    # grid the user can recall in one click — same idea as VHC's presets.
+    presets: dict[str, dict] = field(default_factory=dict)
     # Font sizes (saved + restored). Defaults match the values used in the
     # initial UI build.
     display_font_size: float = 12.0   # LCD strip
@@ -179,6 +285,9 @@ class MacroStore:
         self.grid.rows = int(data.get("rows", 4))
         self.grid.cols = int(data.get("cols", 4))
         self.grid.mock_videohub = bool(data.get("mock_videohub", False))
+        self.grid.videohub_enabled = bool(data.get("videohub_enabled", True))
+        self.grid.keep_on_top = bool(data.get("keep_on_top", False))
+        self.grid.global_hotkeys = bool(data.get("global_hotkeys", False))
         fs = data.get("font_sizes") or {}
         self.grid.display_font_size = float(fs.get("display", 12.0))
         self.grid.title_font_size = float(fs.get("title", 13.0))
@@ -186,7 +295,12 @@ class MacroStore:
         self.grid.macros = {
             mid: Macro.from_dict(m) for mid, m in (data.get("macros") or {}).items()
         }
-        print(f"[macro] Loaded {len(self.grid.macros)} macro(s) "
+        # Presets: each entry is {"rows", "cols", "macros"} — same shape as
+        # the top-level grid snapshot. Stored verbatim; only Macros within
+        # are typed-up at recall time.
+        self.grid.presets = dict(data.get("presets") or {})
+        print(f"[macro] Loaded {len(self.grid.macros)} macro(s), "
+              f"{len(self.grid.presets)} preset(s) "
               f"({self.grid.rows}x{self.grid.cols})")
 
     def save(self) -> None:
@@ -194,17 +308,29 @@ class MacroStore:
             "rows": self.grid.rows,
             "cols": self.grid.cols,
             "mock_videohub": self.grid.mock_videohub,
+            "videohub_enabled": self.grid.videohub_enabled,
+            "keep_on_top": self.grid.keep_on_top,
+            "global_hotkeys": self.grid.global_hotkeys,
             "font_sizes": {
                 "display": self.grid.display_font_size,
                 "title": self.grid.title_font_size,
                 "hotkey": self.grid.hotkey_font_size,
             },
             "macros": {mid: m.to_dict() for mid, m in self.grid.macros.items()},
+            "presets": dict(self.grid.presets),
         }
         try:
             atomic_write_shared_json(self.path, data)
         except Exception as e:
             print(f"[macro] Failed to write {self.path}: {e}")
+
+    def snapshot_current(self) -> dict:
+        """Plain-dict snapshot of the current grid (for storing as a preset)."""
+        return {
+            "rows": self.grid.rows,
+            "cols": self.grid.cols,
+            "macros": {mid: m.to_dict() for mid, m in self.grid.macros.items()},
+        }
 
 
 def atomic_write_shared_json(path: Path, data: dict) -> None:
