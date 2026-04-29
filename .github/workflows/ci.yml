@@ -55,7 +55,7 @@ jobs:
         env:
           PYTHONPATH: src
         run: |
-          pip install pytest pytest-cov coverage-badge
+          pip install pytest pytest-cov coverage-badge setuptools
           pytest tests/ -q \
             --cov=macroflow \
             --cov-report=term
