@@ -22,7 +22,9 @@ chad.littlepage@gmail.com
 
 from __future__ import annotations
 
+import gc
 import os
+import queue
 import sys
 import threading
 
@@ -111,20 +113,30 @@ def safe_is_alive() -> bool:
 
 
 def _current_timeline():
+    """Walk Resolve → PM → Project → Timeline.
+
+    Drops the intermediate ScriptVal refs (pm, project) before returning
+    so they don't escape on the caller's stack frame. macOS 15 + Resolve
+    20.1 segfaults if these get destroyed on a different thread.
+    """
     if not connect():
         return None
-    pm = _resolve.GetProjectManager()
-    if pm is None:
-        print("[resolve] GetProjectManager returned None")
-        return None
-    project = pm.GetCurrentProject()
-    if project is None:
-        print("[resolve] No current project (open a project in Resolve first)")
-        return None
-    tl = project.GetCurrentTimeline()
-    if tl is None:
-        print("[resolve] Project has no current timeline")
-    return tl
+    pm = project = None
+    try:
+        pm = _resolve.GetProjectManager()
+        if pm is None:
+            print("[resolve] GetProjectManager returned None")
+            return None
+        project = pm.GetCurrentProject()
+        if project is None:
+            print("[resolve] No current project (open a project in Resolve first)")
+            return None
+        tl = project.GetCurrentTimeline()
+        if tl is None:
+            print("[resolve] Project has no current timeline")
+        return tl
+    finally:
+        del pm, project
 
 
 def get_video_track_count() -> int:
@@ -139,26 +151,34 @@ def get_video_track_count() -> int:
 
 
 def get_video_track_info() -> list[dict]:
-    """Return [{index, name, enabled}, ...] for every video track. 1-based."""
+    """Return [{index, name, enabled}, ...] for every video track. 1-based.
+
+    Drops the timeline ScriptVal before returning so it gets freed on
+    this (worker) thread, not whichever thread later GCs the caller's
+    locals.
+    """
     tl = _current_timeline()
     if tl is None:
         return []
     info: list[dict] = []
     try:
-        n = int(tl.GetTrackCount("video"))
-    except Exception:
-        return []
-    for idx in range(1, n + 1):
         try:
-            name = tl.GetTrackName("video", idx) or f"V{idx}"
+            n = int(tl.GetTrackCount("video"))
         except Exception:
-            name = f"V{idx}"
-        try:
-            enabled = bool(tl.GetIsTrackEnabled("video", idx))
-        except Exception:
-            enabled = True
-        info.append({"index": idx, "name": name, "enabled": enabled})
-    return info
+            return []
+        for idx in range(1, n + 1):
+            try:
+                name = tl.GetTrackName("video", idx) or f"V{idx}"
+            except Exception:
+                name = f"V{idx}"
+            try:
+                enabled = bool(tl.GetIsTrackEnabled("video", idx))
+            except Exception:
+                enabled = True
+            info.append({"index": idx, "name": name, "enabled": enabled})
+        return info
+    finally:
+        del tl
 
 
 def set_video_track_enabled(track_index: int, enabled: bool) -> bool:
@@ -170,10 +190,16 @@ def set_video_track_enabled(track_index: int, enabled: bool) -> bool:
     except Exception as e:
         print(f"[resolve] SetTrackEnable({track_index}, {enabled}) failed: {e}")
         return False
+    finally:
+        del tl
 
 
 def apply_track_state(track_state: dict[int, bool]) -> bool:
-    """Bulk apply: {1: True, 2: False, 3: True, ...}. Returns True if all set."""
+    """Bulk apply: {1: True, 2: False, 3: True, ...}. Returns True if all set.
+
+    Drops the timeline ScriptVal before returning so it gets freed on
+    this (worker) thread.
+    """
     global LAST_APPLY
     if not track_state:
         LAST_APPLY = {"flipped": [], "unchanged": [], "failed": []}
@@ -186,37 +212,40 @@ def apply_track_state(track_state: dict[int, bool]) -> bool:
     noop: list[int] = []
     failed: list[int] = []
     ok = True
-    for idx, enabled in track_state.items():
-        idx = int(idx)
-        enabled = bool(enabled)
-        try:
-            current = bool(tl.GetIsTrackEnabled("video", idx))
-        except Exception:
-            current = None
-        if current == enabled:
-            noop.append(idx)
-            continue
-        try:
-            result = bool(tl.SetTrackEnable("video", idx, enabled))
-        except Exception as e:
-            print(f"[resolve] SetTrackEnable({idx}, {enabled}) raised {e}")
-            result = False
-        if result:
-            flipped.append((idx, enabled))
-        else:
-            failed.append(idx)
-            ok = False
-    LAST_APPLY = {"flipped": flipped, "unchanged": noop, "failed": failed}
-    parts = []
-    if flipped:
-        parts.append("flipped " + " ".join(
-            f"V{i}{'↑' if en else '↓'}" for i, en in flipped))
-    if noop:
-        parts.append(f"already-set {len(noop)}")
-    if failed:
-        parts.append("failed " + " ".join(f"V{i}" for i in failed))
-    print("[resolve] apply_track_state: " + (", ".join(parts) or "no changes"))
-    return ok
+    try:
+        for idx, enabled in track_state.items():
+            idx = int(idx)
+            enabled = bool(enabled)
+            try:
+                current = bool(tl.GetIsTrackEnabled("video", idx))
+            except Exception:
+                current = None
+            if current == enabled:
+                noop.append(idx)
+                continue
+            try:
+                result = bool(tl.SetTrackEnable("video", idx, enabled))
+            except Exception as e:
+                print(f"[resolve] SetTrackEnable({idx}, {enabled}) raised {e}")
+                result = False
+            if result:
+                flipped.append((idx, enabled))
+            else:
+                failed.append(idx)
+                ok = False
+        LAST_APPLY = {"flipped": flipped, "unchanged": noop, "failed": failed}
+        parts = []
+        if flipped:
+            parts.append("flipped " + " ".join(
+                f"V{i}{'↑' if en else '↓'}" for i, en in flipped))
+        if noop:
+            parts.append(f"already-set {len(noop)}")
+        if failed:
+            parts.append("failed " + " ".join(f"V{i}" for i in failed))
+        print("[resolve] apply_track_state: " + (", ".join(parts) or "no changes"))
+        return ok
+    finally:
+        del tl
 
 
 def get_video_track_transforms() -> dict[int, dict]:
@@ -233,51 +262,60 @@ def get_video_track_transforms() -> dict[int, dict]:
     tl = _current_timeline()
     if tl is None:
         return {}
-    try:
-        n = int(tl.GetTrackCount("video"))
-    except Exception:
-        return {}
     out: dict[int, dict] = {}
-    for idx in range(1, n + 1):
+    items = None  # rebound each track loop; declared here for the outer finally
+    clip = None
+    try:
         try:
-            items = tl.GetItemListInTrack("video", idx) or []
+            n = int(tl.GetTrackCount("video"))
         except Exception:
-            items = []
-        if not items:
-            continue
-        clip = items[0]
-
-        def _f(prop: str, default: float) -> float:
+            return out
+        for idx in range(1, n + 1):
             try:
-                v = clip.GetProperty(prop)
+                items = tl.GetItemListInTrack("video", idx) or []
             except Exception:
-                v = None
-            try:
-                return float(v) if v is not None else float(default)
-            except (ValueError, TypeError):
-                return float(default)
+                items = []
+            if not items:
+                continue
+            clip = items[0]
 
-        try:
-            pan = _f("Pan", 0.0)
-            tilt = _f("Tilt", 0.0)
-            xform = {
-                "quadrant":       _infer_quadrant(pan, tilt),
-                "zoom_x":         _f("ZoomX", 1.0),
-                "zoom_y":         _f("ZoomY", 1.0),
-                "position_x":     pan,
-                "position_y":     tilt,
-                "rotation_angle": _f("RotationAngle", 0.0),
-                "anchor_point_x": _f("AnchorPointX", 0.0),
-                "anchor_point_y": _f("AnchorPointY", 0.0),
-                "pitch":          _f("Pitch", 0.0),
-                "yaw":            _f("Yaw", 0.0),
-                "flip_h":         bool(_f("FlipX", 0.0)),
-                "flip_v":         bool(_f("FlipY", 0.0)),
-            }
-            out[idx] = xform
-        except Exception as e:
-            print(f"[resolve] read transform for V{idx}: {e}")
-    return out
+            def _f(prop: str, default: float, _clip=clip) -> float:
+                try:
+                    v = _clip.GetProperty(prop)
+                except Exception:
+                    v = None
+                try:
+                    return float(v) if v is not None else float(default)
+                except (ValueError, TypeError):
+                    return float(default)
+
+            try:
+                pan = _f("Pan", 0.0)
+                tilt = _f("Tilt", 0.0)
+                xform = {
+                    "quadrant":       _infer_quadrant(pan, tilt),
+                    "zoom_x":         _f("ZoomX", 1.0),
+                    "zoom_y":         _f("ZoomY", 1.0),
+                    "position_x":     pan,
+                    "position_y":     tilt,
+                    "rotation_angle": _f("RotationAngle", 0.0),
+                    "anchor_point_x": _f("AnchorPointX", 0.0),
+                    "anchor_point_y": _f("AnchorPointY", 0.0),
+                    "pitch":          _f("Pitch", 0.0),
+                    "yaw":            _f("Yaw", 0.0),
+                    "flip_h":         bool(_f("FlipX", 0.0)),
+                    "flip_v":         bool(_f("FlipY", 0.0)),
+                }
+                out[idx] = xform
+            except Exception as e:
+                print(f"[resolve] read transform for V{idx}: {e}")
+            finally:
+                # Per-track ScriptVal cleanup before the next iteration.
+                clip = None
+                items = None
+        return out
+    finally:
+        del tl, items, clip
 
 
 def _infer_quadrant(pan: float, tilt: float) -> str:
@@ -337,43 +375,53 @@ def apply_video_track_transforms(transforms: dict[int, dict]) -> bool:
     }
     EPSILON = 1e-6
     ok = True
-    for idx, xform in transforms.items():
-        try:
-            items = tl.GetItemListInTrack("video", int(idx)) or []
-        except Exception:
-            items = []
-        if not items:
-            continue
-        clip = items[0]
-        for our_key, resolve_key in property_map.items():
-            val = xform.get(our_key) if isinstance(xform, dict) else None
-            if val is None:
-                continue
-            # Read current value so we can skip no-op writes.
+    items = None
+    clip = None
+    try:
+        for idx, xform in transforms.items():
             try:
-                cur_raw = clip.GetProperty(resolve_key)
+                items = tl.GetItemListInTrack("video", int(idx)) or []
             except Exception:
-                cur_raw = None
-            try:
-                if our_key in ("flip_h", "flip_v"):
-                    target = 1 if val else 0
-                    cur = 1 if cur_raw else 0
-                    if cur == target:
-                        continue
-                    clip.SetProperty(resolve_key, target)
-                else:
-                    target_f = float(val)
-                    try:
-                        cur_f = float(cur_raw) if cur_raw is not None else None
-                    except (TypeError, ValueError):
-                        cur_f = None
-                    if cur_f is not None and abs(cur_f - target_f) <= EPSILON:
-                        continue
-                    clip.SetProperty(resolve_key, target_f)
-            except Exception as e:
-                print(f"[resolve] SetProperty V{idx} {resolve_key}={val}: {e}")
-                ok = False
-    return ok
+                items = []
+            if not items:
+                continue
+            clip = items[0]
+            for our_key, resolve_key in property_map.items():
+                val = xform.get(our_key) if isinstance(xform, dict) else None
+                if val is None:
+                    continue
+                # Read current value so we can skip no-op writes.
+                try:
+                    cur_raw = clip.GetProperty(resolve_key)
+                except Exception:
+                    cur_raw = None
+                try:
+                    if our_key in ("flip_h", "flip_v"):
+                        target = 1 if val else 0
+                        cur = 1 if cur_raw else 0
+                        if cur == target:
+                            continue
+                        clip.SetProperty(resolve_key, target)
+                    else:
+                        target_f = float(val)
+                        try:
+                            cur_f = float(cur_raw) if cur_raw is not None else None
+                        except (TypeError, ValueError):
+                            cur_f = None
+                        if cur_f is not None and abs(cur_f - target_f) <= EPSILON:
+                            continue
+                        clip.SetProperty(resolve_key, target_f)
+                except Exception as e:
+                    print(f"[resolve] SetProperty V{idx} {resolve_key}={val}: {e}")
+                    ok = False
+            # Drop per-track ScriptVal refs before the next iteration so
+            # they're freed on this thread, not whichever thread later GCs
+            # the loop locals.
+            clip = None
+            items = None
+        return ok
+    finally:
+        del tl, items, clip
 
 
 def get_timeline_resolution() -> tuple[int, int]:
@@ -412,28 +460,87 @@ def get_current_timecode() -> str | None:
 # Python threads do NOT share the main thread's autorelease pool, so running
 # Resolve calls on a worker thread sidesteps the corruption entirely.
 
-def _run_off_main(fn, *, timeout: float = 5.0, default=None):
-    """Run a callable on a worker thread and join."""
-    box: list = [default]
-    err: list = [None]
+# ---------------------------------------------------------------------------
+# Persistent worker thread for all Resolve / Fusion API calls.
+#
+# Why: macOS 15 + Resolve 20.1 segfaults inside Fusion's event queue when
+# ScriptVal objects (clips, tools, comps) are destroyed on a thread other
+# than the one that created them. The previous spawn-a-daemon-per-call
+# pattern destroyed ScriptVals on a thread that died immediately after,
+# letting Resolve's main UI thread later dereference dangling Qt-hash
+# entries. See crash_archive.txt frame 5 (Fusion::ScriptSymbol::~ScriptSymbol)
+# triggered from libfusionsystem's HandleUIEX.
+#
+# Fix: one long-lived worker thread for the lifetime of the app. Every
+# Resolve/Fusion call runs on it, and a gc.collect() runs at the END of
+# each call so any ScriptVals created during the call are freed on the
+# same thread, deterministically, before control returns.
+# ---------------------------------------------------------------------------
 
-    def _worker():
+_WORKER_QUEUE: "queue.Queue[tuple]" = queue.Queue()
+_WORKER_THREAD: threading.Thread | None = None
+_WORKER_LOCK = threading.Lock()
+
+
+def _worker_loop() -> None:
+    while True:
+        item = _WORKER_QUEUE.get()
+        if item is None:  # shutdown sentinel (unused today; here for safety)
+            return
+        fn, result_box, err_box, done = item
         try:
-            box[0] = fn()
-        except Exception as e:  # pragma: no cover
-            err[0] = e
+            result_box.append(fn())
+        except Exception as e:
+            err_box.append(e)
+        finally:
+            # CRITICAL: free any Resolve/Fusion ScriptVal references that
+            # were created during fn() *here*, on the worker thread, before
+            # we signal completion. Letting them outlive this call means
+            # they get freed on whatever thread happens to GC them next —
+            # often Resolve's UI thread, where it crashes on macOS 15.
+            try:
+                gc.collect()
+            except Exception:
+                pass
+            done.set()
 
-    t = threading.Thread(target=_worker, daemon=True)
-    t.start()
-    t.join(timeout=timeout)
-    name = getattr(fn, "__name__", None) or getattr(fn, "func", fn).__name__
-    if t.is_alive():
+
+def _ensure_worker() -> None:
+    global _WORKER_THREAD
+    with _WORKER_LOCK:
+        if _WORKER_THREAD is not None and _WORKER_THREAD.is_alive():
+            return
+        # daemon=True so the thread doesn't block app exit. Within a call,
+        # however, it is the *only* thread that ever touches Resolve API,
+        # which is what fixes the cross-thread ScriptVal destruction bug.
+        _WORKER_THREAD = threading.Thread(
+            target=_worker_loop, daemon=True, name="macroflow-resolve-worker",
+        )
+        _WORKER_THREAD.start()
+
+
+def _run_off_main(fn, *, timeout: float = 5.0, default=None):
+    """Run a callable on the persistent Resolve worker thread.
+
+    Every Resolve/Fusion call goes through here so ScriptVal lifetimes
+    stay on a single thread. After fn() returns, gc.collect() runs on the
+    worker thread to deterministically free any ScriptVal refs created
+    inside fn before control returns to the caller.
+    """
+    _ensure_worker()
+    result_box: list = []
+    err_box: list = []
+    done = threading.Event()
+    _WORKER_QUEUE.put((fn, result_box, err_box, done))
+    if not done.wait(timeout=timeout):
+        name = getattr(fn, "__name__", None) or getattr(fn, "func", fn).__name__
         print(f"[resolve] {name} timed out after {timeout}s")
         return default
-    if err[0] is not None:
-        print(f"[resolve] {name} raised {err[0]}")
+    name = getattr(fn, "__name__", None) or getattr(fn, "func", fn).__name__
+    if err_box:
+        print(f"[resolve] {name} raised {err_box[0]}")
         return default
-    return box[0]
+    return result_box[0] if result_box else default
 
 
 def safe_get_video_track_info() -> list[dict]:
