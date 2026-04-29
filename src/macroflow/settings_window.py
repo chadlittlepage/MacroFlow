@@ -61,21 +61,40 @@ class _SettingsController(NSObject):
         self.controller._store.grid.display_font_size = v
         self.display_label.setStringValue_(f"Display: {int(v)}pt")
         self.controller._apply_font_sizes()
-        self.controller._store.save()
+        self._schedule_debounced_save()
 
     def titleChanged_(self, sender):  # NOQA: N802
         v = float(sender.floatValue())
         self.controller._store.grid.title_font_size = v
         self.title_label.setStringValue_(f"Title: {int(v)}pt")
         self.controller._apply_font_sizes()
-        self.controller._store.save()
+        self._schedule_debounced_save()
 
     def hotkeyChanged_(self, sender):  # NOQA: N802
         v = float(sender.floatValue())
         self.controller._store.grid.hotkey_font_size = v
         self.hotkey_label.setStringValue_(f"Hotkey: {int(v)}pt")
         self.controller._apply_font_sizes()
-        self.controller._store.save()
+        self._schedule_debounced_save()
+
+    @objc.python_method
+    def _schedule_debounced_save(self) -> None:
+        """Coalesce slider-drag saves. NSSlider in continuous mode fires its
+        action on every pixel of mouse movement — saving on each tick was
+        writing macroflow.json dozens of times per drag. Schedule a single
+        deferred save on the runloop and cancel-and-reschedule on each new
+        tick; the actual save lands ~250 ms after the user stops moving.
+        """
+        NSObject.cancelPreviousPerformRequestsWithTarget_selector_object_(
+            self, b"_saveNow:", None,
+        )
+        self.performSelector_withObject_afterDelay_(b"_saveNow:", None, 0.25)
+
+    def _saveNow_(self, _arg):  # NOQA: N802 (Cocoa selector)
+        try:
+            self.controller._store.save()
+        except Exception as e:
+            print(f"[settings] debounced save failed: {e}")
 
     def gridSizeChanged_(self, sender):  # NOQA: N802
         idx = int(sender.indexOfSelectedItem())
