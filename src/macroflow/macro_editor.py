@@ -287,6 +287,13 @@ class MacroEditorWindow(NSWindow):
         if self is None:
             return None
         self.setReleasedWhenClosed_(False)
+        # Always float over other apps (DaVinci Resolve etc.) so the editor
+        # stays visible while the user keeps Resolve focused for live preview.
+        try:
+            from AppKit import NSFloatingWindowLevel
+            self.setLevel_(NSFloatingWindowLevel)
+        except Exception:
+            pass
         self.setBackgroundColor_(
             NSColor.colorWithCalibratedRed_green_blue_alpha_(*WINDOW_BG),
         )
@@ -476,6 +483,26 @@ class MacroEditorWindow(NSWindow):
         )
         sh2.setAutoresizingMask_(TOP_PIN | NSViewWidthSizable)
         y -= 24
+
+        # Timeline-resolution dropdown. Auto-detect is shown first (with
+        # the value Resolve reports), then explicit Resolve presets so the
+        # user can override on-the-spot if Resolve's API is wrong (compound
+        # clips / nested timelines on macOS 15 sometimes return 1920×1080
+        # for an 8K timeline). Quadrant offsets snap to ±tl_w/2, ±tl_h/2,
+        # so this drives the entire transform math.
+        from AppKit import NSPopUpButton as _NSPopUp
+        tl_label = self._add_label(content, "Timeline:", x=20, y=y + 4)
+        tl_label.setFrame_(NSMakeRect(20, y + 4, 80, 18))
+        tl_label.setAutoresizingMask_(TOP_PIN)
+        self._tl_popup = _NSPopUp.alloc().initWithFrame_(
+            NSMakeRect(100, y, 320, 26),
+        )
+        self._tl_popup.setAutoresizingMask_(TOP_PIN)
+        self._build_tl_popup_items()
+        self._tl_popup.setTarget_(self)
+        self._tl_popup.setAction_("timelineResolutionPopupChanged:")
+        content.addSubview_(self._tl_popup)
+        y -= 36
 
         # Tracks region spans from y down to ~80 (above bottom buttons).
         tracks_bottom = 80
@@ -766,7 +793,7 @@ class MacroEditorWindow(NSWindow):
         content.addSubview_(cancel_btn)
 
         clear_btn = NSButton.alloc().initWithFrame_(NSMakeRect(20, 20, 100, 32))
-        clear_btn.setTitle_("Clear cell")
+        clear_btn.setTitle_("Clear Macro")
         clear_btn.setBezelStyle_(1)
         clear_btn.setTarget_(self)
         clear_btn.setAction_("clearCell:")
@@ -899,6 +926,90 @@ class MacroEditorWindow(NSWindow):
     def _track_default_dict(self) -> dict:
         return {"enabled": False, **dict(_DEFAULT_TRANSFORM)}
 
+    # Standard Resolve timeline resolutions surfaced in the editor's
+    # Timeline dropdown. (key, label) — `key` is what we persist into
+    # MacroGrid.timeline_resolution.
+    _TL_PRESETS = [
+        ("1280x720",  "1280 × 720    (HD 720p)"),
+        ("1920x1080", "1920 × 1080  (HD 1080p)"),
+        ("2048x1080", "2048 × 1080  (2K DCI)"),
+        ("3840x2160", "3840 × 2160  (UHD 4K)"),
+        ("4096x2160", "4096 × 2160  (DCI 4K)"),
+        ("5120x2700", "5120 × 2700  (5K)"),
+        ("6144x3240", "6144 × 3240  (6K DCI)"),
+        ("7680x4320", "7680 × 4320  (UHD 8K)"),
+        ("8192x4320", "8192 × 4320  (DCI 8K)"),
+    ]
+
+    @objc.python_method
+    def _build_tl_popup_items(self) -> None:
+        """Populate the timeline-resolution dropdown with Auto-detect first
+        (annotated with whatever Resolve reports right now) and Resolve
+        presets after."""
+        try:
+            auto_w, auto_h = resolve.safe_get_timeline_resolution()
+        except Exception:
+            auto_w, auto_h = 1920, 1080
+        self._tl_popup.removeAllItems()
+        self._tl_popup_keys: list[str] = []
+        self._tl_popup.addItemWithTitle_(
+            f"Auto-detect  ({auto_w} × {auto_h} from Resolve)"
+        )
+        self._tl_popup_keys.append("auto")
+        for key, label in self._TL_PRESETS:
+            self._tl_popup.addItemWithTitle_(label)
+            self._tl_popup_keys.append(key)
+        # Pre-select the saved override.
+        current = getattr(
+            self._controller._store.grid, "timeline_resolution", "auto",
+        ) or "auto"
+        if current in self._tl_popup_keys:
+            self._tl_popup.selectItemAtIndex_(
+                self._tl_popup_keys.index(current),
+            )
+        else:
+            self._tl_popup.selectItemAtIndex_(0)
+
+    def timelineResolutionPopupChanged_(self, sender):  # NOQA: N802
+        idx = int(sender.indexOfSelectedItem())
+        keys = getattr(self, "_tl_popup_keys", [])
+        if idx < 0 or idx >= len(keys):
+            return
+        new_key = keys[idx]
+        # Persist on the grid so Settings + future editor sessions agree.
+        self._controller._store.grid.timeline_resolution = new_key
+        try:
+            self._controller._store.save()
+        except Exception as e:
+            print(f"[editor] save after timeline-res change failed: {e}")
+        # Recompute _tl_w / _tl_h from the new value.
+        if new_key == "auto":
+            try:
+                self._tl_w, self._tl_h = resolve.safe_get_timeline_resolution()
+            except Exception:
+                pass
+        else:
+            try:
+                w_str, h_str = new_key.split("x", 1)
+                self._tl_w = int(w_str)
+                self._tl_h = int(h_str)
+            except (TypeError, ValueError):
+                pass
+        print(
+            f"[editor] timeline_resolution = {new_key} "
+            f"(_tl_w={self._tl_w}, _tl_h={self._tl_h})"
+        )
+        # Refresh the currently-selected track's quadrant snap so the user
+        # sees the new offsets without having to re-pick the quadrant.
+        sel_idx = self._selected_track_index()
+        if sel_idx is not None:
+            entry = self._track_working.get(int(sel_idx))
+            if entry:
+                quad = entry.get("quadrant", "Q1")
+                self._apply_quadrant_to_entry(int(sel_idx), entry, quad)
+                self._populate_track_detail()
+                self._apply_live_track_transform(int(sel_idx))
+
     @objc.python_method
     def _populate_resolve_tracks(self) -> None:
         if self._cached_tracks is None:
@@ -913,7 +1024,9 @@ class MacroEditorWindow(NSWindow):
         # is the workaround for projects where Resolve's GetSetting returns
         # empty (compound clips, nested timelines, certain Resolve 20.1 +
         # macOS 15 builds).
-        override = getattr(self._store.grid, "timeline_resolution", "auto")
+        override = getattr(
+            self._controller._store.grid, "timeline_resolution", "auto",
+        )
         if override and override != "auto" and "x" in override:
             try:
                 w_str, h_str = override.split("x", 1)
@@ -1172,6 +1285,7 @@ class MacroEditorWindow(NSWindow):
                     NSIndexSet.indexSetWithIndex_(i), False,
                 )
                 break
+        self._schedule_autosave()
 
     def quadrantChanged_(self, sender) -> None:  # NOQA: N802
         idx = self._selected_track_index()
@@ -1182,6 +1296,7 @@ class MacroEditorWindow(NSWindow):
         self._apply_quadrant_to_entry(int(idx), entry, quad)
         self._populate_track_detail()
         self._apply_live_track_transform(int(idx))
+        self._schedule_autosave()
 
     @objc.python_method
     def _on_quad_preview_click(self, quad: str) -> None:
@@ -1201,6 +1316,7 @@ class MacroEditorWindow(NSWindow):
             pass
         self._populate_track_detail()
         self._apply_live_track_transform(int(idx))
+        self._schedule_autosave()
 
     def flipChanged_(self, sender) -> None:  # NOQA: N802
         idx = self._selected_track_index()
@@ -1212,6 +1328,7 @@ class MacroEditorWindow(NSWindow):
         elif sender is self._flip_v_check:
             entry["flip_v"] = bool(int(sender.state()) == 1)
         self._apply_live_track_transform(int(idx))
+        self._schedule_autosave()
 
     @objc.python_method
     def _reset_track_to_live(self, idx: int) -> None:
@@ -1355,6 +1472,7 @@ class MacroEditorWindow(NSWindow):
             return
         entry = self._track_working.setdefault(int(idx), self._track_default_dict())
         entry[key] = val
+        self._schedule_autosave()
 
     @objc.python_method
     def _update_cell_indicator(self) -> None:
@@ -1388,6 +1506,7 @@ class MacroEditorWindow(NSWindow):
     def videohubMacroEnableChanged_(self, sender) -> None:  # NOQA: N802
         self._macro.videohub_enabled = bool(int(sender.state()) == 1)
         self._apply_videohub_field_state()
+        self._schedule_autosave()
 
     @objc.python_method
     def _apply_videohub_field_state(self) -> None:
@@ -1477,6 +1596,30 @@ class MacroEditorWindow(NSWindow):
         else:
             setattr(existing, attr, value)
         ctrl._refresh_cell_titles()
+        self._schedule_autosave()
+
+    @objc.python_method
+    def _schedule_autosave(self) -> None:
+        """Debounced full commit + save. Every mutation in the editor
+        funnels into _stage_live / _stage_transform_field / quadrant +
+        flip changes, all of which call this. The actual disk write
+        runs ~300 ms after the last mutation so a slider drag doesn't
+        produce 60 writes per second."""
+        try:
+            NSObject.cancelPreviousPerformRequestsWithTarget_selector_object_(
+                self, b"_doAutosave:", None,
+            )
+            self.performSelector_withObject_afterDelay_(
+                b"_doAutosave:", None, 0.30,
+            )
+        except Exception as e:
+            print(f"[editor] schedule autosave failed: {e}")
+
+    def _doAutosave_(self, _arg):  # NOQA: N802
+        try:
+            self._commit_to_store(persist=True)
+        except Exception as e:
+            print(f"[editor] autosave commit failed: {e}")
 
     def deviceChanged_(self, sender) -> None:  # NOQA: N802
         self._populate_presets_for_current_device()
@@ -1616,6 +1759,32 @@ class MacroEditorWindow(NSWindow):
     def clearCell_(self, sender) -> None:  # NOQA: N802
         ctrl = self._controller
         row, col = self._row, self._col
+        # Confirm before nuking the macro — easy to mis-click otherwise.
+        from AppKit import (
+            NSAlert,
+            NSAlertFirstButtonReturn,
+            NSAlertStyleWarning,
+            NSAppearance,
+        )
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_("Clear this macro?")
+        alert.setInformativeText_(
+            f"This will delete the macro at R{row + 1}C{col + 1} "
+            f"(label, color, hotkey, Videohub action, and all per-track "
+            f"transforms). You can undo with Cmd+Z."
+        )
+        alert.setAlertStyle_(NSAlertStyleWarning)
+        alert.addButtonWithTitle_("Clear Macro")
+        alert.addButtonWithTitle_("Cancel")
+        try:
+            dark = NSAppearance.appearanceNamed_("NSAppearanceNameDarkAqua")
+            if dark:
+                alert.window().setAppearance_(dark)
+        except Exception:
+            pass
+        if int(alert.runModal()) != NSAlertFirstButtonReturn:
+            return
+
         # Snapshot the prior macro (as plain dict) so undo can restore it.
         prev = ctrl._store.grid.get(row, col)
         prev_dict = prev.to_dict() if prev is not None else None

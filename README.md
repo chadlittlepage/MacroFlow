@@ -100,8 +100,11 @@ macro). Use the popup + Save / Delete buttons in the top strip:
 ## The Macro Editor
 
 Open with right-click, Cmd+Click, Ctrl+Click, or Cmd+E (after selecting).
-The editor is non-modal and stays open across cells. ◀ / ▶ at the top
-right step through every cell, auto-saving the current cell first.
+The editor is non-modal, **floats over other apps** so DaVinci Resolve
+can stay focused for live preview, and is **single-instance** — opening
+for a different cell closes the previous editor instead of stacking
+windows. Re-opening for the same cell brings the existing window forward.
+◀ / ▶ at the top right step through every cell, autosaving as you go.
 
 ![MacroFlow Edit Macro window](docs/screenshots/edit-macro.png)
 
@@ -123,6 +126,18 @@ include Videohub in this macro:
 - **Preset** — picks from that device's saved presets.
 
 ### DaVinci Resolve video tracks
+
+**Timeline resolution** — A dropdown above the track list. The first
+option auto-detects from Resolve and shows the value inline (e.g.
+`Auto-detect (3840 × 2160 from Resolve)`). The remaining options pin
+to common Resolve resolutions: HD 720p / HD 1080p / 2K DCI / UHD 4K /
+DCI 4K / 5K / 6K DCI / UHD 8K / DCI 8K. The quadrant snap-offsets are
+computed from this value, so for a 4K timeline Q2 lands at
+`(+1920, +1080)`; for 8K it's `(+3840, +2160)`. Use the override when
+Resolve's API returns the wrong value (compound clips and nested
+timelines on macOS 15 sometimes report 1920×1080 for an 8K timeline).
+The choice persists across sessions and is mirrored in
+**Settings → Timeline**.
 
 Track list (left pane, draggable divider) lists tracks descending —
 `Vn` at the top, `V1` at the bottom — to match Resolve's timeline.
@@ -170,7 +185,37 @@ EVERY change pushes to Resolve so you see it on the timeline immediately:
   (so the Fusion bridge isn't flooded mid-drag)
 - Reset Selected / Reset All Tracks → pushes the captured values back
 
-Edits are persisted to `macroflow.json` on Save and on cell navigation.
+### Autosave + playhead-aware writes
+
+**Autosave** — every macro mutation (label, color, hotkey, Videohub
+device/preset, quadrant pick, flip toggle, transform field, track-enable
+check, drag-scrub mouse-up, Clear Macro) is persisted to
+`macroflow.json` ~300 ms after your last edit. The **Save** button
+still works — it's a "save now" force-flush rather than the only path
+to disk. Closing the editor without Save is safe.
+
+**Playhead-aware** — transforms apply to (and read back from) the clip
+**currently under the playhead** on each track, NOT the leftmost clip.
+If V1 has multiple clips (NINJAV, a compound, color bars, …) and
+you're parked on the compound, the compound is what MacroFlow writes
+to. If the playhead is in dead space on a track, that track is silently
+skipped — leftmost clips never get accidentally re-positioned.
+
+### Clear Macro
+
+The **Clear Macro** button at the bottom-left of the editor wipes the
+current cell's macro (label, color, hotkey, Videohub action, all
+per-track transforms) after a confirmation dialog. Cmd+Z restores it.
+
+### Copy / Paste macros
+
+| Shortcut | Effect |
+|---|---|
+| Click a cell, then **Cmd+C** (or Edit > Copy) | Copies the entire macro — label, color, hotkey, Videohub action, every per-track transform |
+| Click another cell, then **Cmd+V** (or Edit > Paste) | Pastes onto that cell. Cmd+Z undoes the paste |
+
+When focus is in a text field, Cmd+C / Cmd+V work as standard text
+edit copy/paste — no interference.
 
 ### Quit-restore
 
@@ -192,10 +237,16 @@ back, undoing any changes MacroFlow made during the session. Force-quit
   saves are debounced 250 ms after the last drag tick. The LCD strip
   auto-grows so the display font stays vertically centered, and the
   status row + grid push down rather than overlap.
-- **Reset to Defaults** — restores 12 / 13 / 26 pt (undoable).
+- **Reset to Defaults** — restores 12 / 13 / 26 pt font sizes (undoable).
+- **Reset All** — destructive nuke: every macro, every preset, and
+  every setting back to defaults. Confirmation dialog asks first, NO
+  undo. Use **Export Settings…** first if you want a recovery file.
 - **Grid size** — 4×4, 6×6, 8×8, 10×10, 12×12, 20×20, 40×40. Live-resize
   without restart. Macros at out-of-bounds coordinates are kept in
   storage and reappear if you grow the grid back.
+- **Timeline** — resolution override that drives the editor's quadrant
+  math. Auto-detect (default), HD, 2K DCI, UHD 4K, DCI 4K, UHD 8K, DCI
+  8K. Same dropdown is mirrored at the top of Edit Macro.
 - **Enable Videohub backend** — master switch. When off: VIDEOHUB status
   indicator hides, the status probe is skipped, and recall short-circuits
   to no-op. The editor's Videohub fields can still be configured for
@@ -204,9 +255,10 @@ back, undoing any changes MacroFlow made during the session. Force-quit
   - **Keep on Top** — floats the MacroFlow window above other apps
     (DaVinci Resolve, etc.) using `NSFloatingWindowLevel`.
   - **Global Hotkeys** — macro hotkeys fire even when MacroFlow is not
-    the focused app. Requires Accessibility permission (System Settings →
-    Privacy & Security → Accessibility). MacroFlow prompts the first
-    time you tick it.
+    the focused app. **macOS 15+ requires both Accessibility AND Input
+    Monitoring** permissions (System Settings → Privacy & Security →
+    both lists). Pre-15 only needed Accessibility. The in-app prompt
+    links to System Settings and tells you which lists to tick.
 
 ---
 
@@ -281,6 +333,7 @@ at the target are NOT followed.
   "keep_on_top": false,
   "global_hotkeys": false,
   "font_sizes": {"display": 12, "title": 13, "hotkey": 26},
+  "timeline_resolution": "auto",
   "presets": { "Preset 1": {"rows": 4, "cols": 4, "macros": {…}} },
   "macros": {
     "0,0": {
@@ -302,6 +355,27 @@ at the target are NOT followed.
 editor prefers a name match over an idx match — so inserting / deleting
 Resolve tracks (which shifts indices) leaves your saved transforms
 attached to the correct physical track.
+
+## Multi-user
+
+Every user on the same Mac reads + writes the same shared config file
+(`/Users/Shared/MacroFlow/macroflow.json`, `0o666`). Configure macros
+on one account, log into another → same macros, settings, and presets
+appear. Same applies to Videohub Controller's config.
+
+## Export / Import / Reset All
+
+| Action | Shortcut | What it does |
+|---|---|---|
+| **Export Settings…** | Cmd+Shift+E | Writes a verbatim copy of `macroflow.json` to a path you pick. Captures every macro, every preset, all settings, including `timeline_resolution`. |
+| **Import Settings…** | Cmd+Shift+I | Atomic-writes the chosen `.json` over the live config and reloads in place. No restart required. |
+| **Settings → Reset All** | — | Wipes every macro + every setting back to defaults. Confirmation dialog asks first; **NO undo**. |
+
+Recommended workflow: **Export first, then Reset.** If you regret the
+reset, Import restores everything byte-for-byte. The round-trip is
+verified by an in-repo simulation that exercises a maximally-loaded
+config through Save → Export → Reset → Import → reload and confirms
+nothing is dropped.
 
 ---
 

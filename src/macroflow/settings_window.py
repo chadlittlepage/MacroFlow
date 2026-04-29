@@ -172,6 +172,80 @@ class _SettingsController(NSObject):
         except Exception:
             pass
 
+    def resetAll_(self, sender):  # NOQA: N802
+        """Nuke every setting + every macro back to a brand-new install.
+
+        Confirms first because there is NO undo. The shared config file at
+        /Users/Shared/MacroFlow/macroflow.json is rewritten with a fresh
+        MacroGrid; the in-memory store reloads; the live UI reflows.
+        """
+        from AppKit import (
+            NSAlert,
+            NSAlertFirstButtonReturn,
+            NSAlertStyleCritical,
+            NSAppearance,
+        )
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_("Reset everything?")
+        alert.setInformativeText_(
+            "This deletes every macro, every preset, and every setting on "
+            "this Mac (the file is shared across all users). Font sizes, "
+            "grid size, Videohub state, hotkey behavior, and all macros "
+            "in every cell will be wiped.\n\n"
+            "There is NO undo. Are you sure?"
+        )
+        alert.setAlertStyle_(NSAlertStyleCritical)
+        alert.addButtonWithTitle_("Reset All")
+        alert.addButtonWithTitle_("Cancel")
+        try:
+            dark = NSAppearance.appearanceNamed_("NSAppearanceNameDarkAqua")
+            if dark:
+                alert.window().setAppearance_(dark)
+        except Exception:
+            pass
+        if int(alert.runModal()) != NSAlertFirstButtonReturn:
+            return
+
+        ctrl = self.controller
+        from macroflow.macro import MacroGrid
+        # Replace the grid wholesale with a fresh default, then write it
+        # to disk so other users on this Mac see the reset too.
+        ctrl._store.grid = MacroGrid()
+        try:
+            ctrl._store.save()
+        except Exception as e:
+            print(f"[settings] Reset All save failed: {e}")
+        # Live UI reflow: rebuild cells at the new grid size, refresh font
+        # sizes from the new defaults, push the new resolution dropdown
+        # value through, repaint cells.
+        try:
+            ctrl.apply_grid_size(ctrl._store.grid.rows, ctrl._store.grid.cols)
+        except Exception as e:
+            print(f"[settings] Reset All grid relayout failed: {e}")
+        try:
+            ctrl._apply_font_sizes()
+        except Exception:
+            pass
+        try:
+            ctrl._refresh_cell_titles()
+        except Exception:
+            pass
+        # Resync the Settings window controls to the new defaults so the
+        # user can see the reset took effect without closing + reopening.
+        try:
+            self._apply_font_sizes(
+                float(DEFAULT_DISPLAY),
+                float(DEFAULT_TITLE),
+                float(DEFAULT_HOTKEY),
+            )
+            self.keep_on_top_check.setState_(0)
+            self.global_hotkeys_check.setState_(0)
+            if hasattr(self, "tl_popup"):
+                self.tl_popup.selectItemAtIndex_(0)
+        except Exception:
+            pass
+        print("[settings] Reset All complete — every setting + macro wiped.")
+
     @objc.python_method
     def _apply_font_sizes(self, display: float, title: float, hotkey: float) -> None:
         grid = self.controller._store.grid
@@ -189,6 +263,17 @@ class _SettingsController(NSObject):
 
 
 def show_settings_window(controller) -> None:
+    # Single-instance: if a Settings window is already open, just focus it.
+    # No need to spawn a duplicate.
+    if _RETAINED:
+        try:
+            existing_sc, existing_window = _RETAINED[-1]
+            if existing_window is not None and existing_window.isVisible():
+                existing_window.makeKeyAndOrderFront_(None)
+                return
+        except Exception:
+            pass
+        _RETAINED.clear()
     sc = _SettingsController.alloc().init()
     sc.attach(controller)
 
@@ -390,15 +475,30 @@ def show_settings_window(controller) -> None:
         grid.global_hotkeys, "globalHotkeysToggled:",
     )
 
-    # Reset to Defaults button — sits beneath the three sliders.
+    # Bottom row — Reset to Defaults (font sizes only) + Reset All
+    # (full nuke: every setting + every macro back to ground zero).
+    btn_row_y = 30
+    btn_w = 170
+    gap = 14
+    total_w = btn_w * 2 + gap
+    left_x = (win_w - total_w) / 2
     reset_btn = NSButton.alloc().initWithFrame_(
-        NSMakeRect((win_w - 160) / 2, 30, 160, 32),
+        NSMakeRect(left_x, btn_row_y, btn_w, 32),
     )
     reset_btn.setTitle_("Reset to Defaults")
     reset_btn.setBezelStyle_(NSBezelStyleRounded)
     reset_btn.setTarget_(sc)
     reset_btn.setAction_("resetDefaults:")
     content.addSubview_(reset_btn)
+
+    reset_all_btn = NSButton.alloc().initWithFrame_(
+        NSMakeRect(left_x + btn_w + gap, btn_row_y, btn_w, 32),
+    )
+    reset_all_btn.setTitle_("Reset All")
+    reset_all_btn.setBezelStyle_(NSBezelStyleRounded)
+    reset_all_btn.setTarget_(sc)
+    reset_all_btn.setAction_("resetAll:")
+    content.addSubview_(reset_all_btn)
 
     window.setLevel_(NSFloatingWindowLevel)
     window.makeKeyAndOrderFront_(None)

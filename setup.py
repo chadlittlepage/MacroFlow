@@ -42,6 +42,11 @@ OPTIONS = {
             "automation targets on your local network.",
         "NSAppleEventsUsageDescription":
             "MacroFlow controls DaVinci Resolve via its scripting API.",
+        "NSInputMonitoringUsageDescription":
+            "MacroFlow needs Input Monitoring to fire macro hotkeys when "
+            "another app (e.g. DaVinci Resolve) is focused. macOS 15+ "
+            "moved global keyboard capture from Accessibility to Input "
+            "Monitoring, so this is required for Global Hotkeys to work.",
     },
     "packages": [
         "macroflow",

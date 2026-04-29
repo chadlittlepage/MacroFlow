@@ -65,6 +65,13 @@ Default grid: 4×4 (16 cells). Configurable in Settings up to 40×40.
   • Right-click a cell          Open the macro editor.
   • Cmd+Click / Ctrl+Click      Open the macro editor.
   • Press a cell's hotkey       Fire that cell from anywhere in the app.
+  • Cmd+C / Edit > Copy         Copy the entire selected macro
+                                (label, color, hotkey, Videohub action,
+                                 every per-track transform).
+  • Cmd+V / Edit > Paste        Paste the copied macro onto the
+                                selected cell. Cmd+Z undoes the paste.
+                                Inside a text field, Cmd+C/V works as
+                                normal text copy/paste.
   • Arrow ↑ / ↓ / ← / →         Move the keyboard selection. Left/right
                                 wrap to the opposite column on the row.
                                 Up/down clamp at the top/bottom row.
@@ -104,8 +111,12 @@ THE MACRO EDITOR
 ----------------
 Open with right-click, Cmd+Click, Ctrl+Click, or Cmd+E (after selecting).
 
-The editor is non-modal and stays open across cells. ◀ / ▶ at the
-top right step through every cell, auto-saving the current cell first.
+The editor is non-modal, FLOATS over other apps (so DaVinci Resolve
+can stay focused for live preview), and is SINGLE-INSTANCE: opening
+for a different cell closes the previous editor instead of stacking.
+Re-opening for the same cell just brings the existing window forward.
+
+◀ / ▶ at the top right step through every cell, auto-saving as you go.
 
 Top section
   Label                Free-text name on the cell.
@@ -125,6 +136,21 @@ Videohub section  (header has a per-macro "Enable" checkbox)
   Preset                Picks from that device's saved presets.
 
 DaVinci Resolve video tracks
+  Timeline             Resolution dropdown ABOVE the track list. First
+                       option auto-detects from Resolve and shows the
+                       reading inline (e.g. "Auto-detect (3840 × 2160
+                       from Resolve)"). The remaining options pin the
+                       value: HD 720p / HD 1080p / 2K DCI / UHD 4K /
+                       DCI 4K / 5K / 6K DCI / UHD 8K / DCI 8K.
+                       Quadrant offsets snap to ±tl_w/2, ±tl_h/2 from
+                       this value, so for a 4K timeline Q2 lands at
+                       (+1920, +1080); for 8K it's (+3840, +2160). Use
+                       the override when Resolve's GetSetting returns
+                       wrong (compound clips / nested timelines on
+                       macOS 15 sometimes report 1920×1080 for an 8K
+                       timeline). The choice persists across sessions
+                       and syncs with Settings → Timeline.
+
   Track list (left pane, draggable divider) lists tracks descending —
   Vn at the top, V1 at the bottom — to match Resolve's timeline.
 
@@ -165,6 +191,15 @@ DaVinci Resolve video tracks
                          Track ENABLE flag is preserved.
     Reset All Tracks     Same, applied to every track.
     Quad preview (2×2)   Click any quadrant in the preview to set it.
+    Clear Macro          Wipe this cell's macro (label, color, hotkey,
+                         Videohub action, every per-track transform).
+                         A confirmation dialog asks "Clear this macro?"
+                         before nuking. Cmd+Z restores the cleared
+                         macro.
+    Save                 Force-flush to disk now. Mostly redundant —
+                         autosave already commits every change ~300 ms
+                         after you stop typing / dragging / clicking.
+                         Save is here for peace-of-mind.
 
 LIVE PREVIEW IN RESOLVE
 -----------------------
@@ -186,7 +221,27 @@ When the "Live update Resolve" checkbox is OFF, the editor still shows
 all the values changing in its own UI — the Resolve clip just doesn't
 move until you tick the checkbox back on (or Save and fire the macro).
 
-Edits are persisted to macroflow.json on Save and on cell navigation.
+AUTOSAVE
+--------
+Every macro mutation (label, color, hotkey, Videohub device/preset,
+quadrant pick, flip toggle, transform field, track-enable check,
+quad-preview click, drag-scrub mouseup) is persisted to macroflow.json
+~300 ms after the last edit. Slider drags emit at most ~3 writes per
+second so the disk doesn't thrash.
+
+The Save button still works — it's a "save now" force-flush rather
+than the only path to disk. Closing the editor without Save is safe;
+your edits are already on disk.
+
+PLAYHEAD-AWARE WRITES
+---------------------
+When applying transforms and reading current values, MacroFlow targets
+the clip CURRENTLY UNDER THE PLAYHEAD on each track, NOT the leftmost
+clip on the track. If you have multiple clips on V1 (NINJAV..., a
+compound clip, color bars...) and you're parked on the compound, that
+is the clip MacroFlow writes to. If the playhead is in dead space on
+a track, that track is silently skipped — leftmost clips never get
+accidentally re-positioned.
 
 QUIT-RESTORE
 ------------
@@ -226,13 +281,26 @@ SETTINGS  (Cmd+,)
                                      font stays vertically centered;
                                      the status row + grid push down
                                      rather than overlap.
-  Reset to Defaults                  Restores 12 / 13 / 26 pt (undoable).
+  Reset to Defaults                  Restores 12 / 13 / 26 pt font sizes
+                                     (undoable).
+  Reset All                          NUKES every macro, every preset,
+                                     and every setting back to defaults.
+                                     Confirmation dialog asks first; NO
+                                     undo. Use Export Settings… first if
+                                     you want a recovery file.
   Grid size                          4×4, 6×6, 8×8, 10×10, 12×12, 20×20,
                                      40×40. Live-resize without restart.
                                      Macros at out-of-bounds coordinates
                                      are kept in storage and reappear if
                                      you grow the grid back. Their hot-
                                      keys won't fire while out of bounds.
+  Timeline                           Resolution override that drives the
+                                     editor's quadrant math. Auto-detect
+                                     (default) reads from Resolve. The
+                                     other options pin to common Resolve
+                                     resolutions (HD / 2K DCI / UHD 4K /
+                                     DCI 4K / UHD 8K). Same dropdown is
+                                     mirrored at the top of Edit Macro.
   Enable Videohub backend            Master switch. When off:
                                        • VIDEOHUB status indicator hides.
                                        • Status probe is skipped.
@@ -248,14 +316,19 @@ SETTINGS  (Cmd+,)
                                      other apps (DaVinci Resolve, etc.).
                                      Uses NSFloatingWindowLevel.
   Global Hotkeys                     Macro hotkeys fire even when MacroFlow
-                                     is not the focused app. Requires
-                                     Accessibility permission (System
-                                     Settings → Privacy & Security →
-                                     Accessibility). MacroFlow prompts
-                                     the first time you tick it.
-                                     macOS routes events to LOCAL or
-                                     GLOBAL monitor based on focus, never
-                                     both — no double-fire.
+                                     is not the focused app. macOS 15+
+                                     requires BOTH Accessibility AND Input
+                                     Monitoring permissions (System Settings
+                                     → Privacy & Security → both lists);
+                                     pre-15 only needed Accessibility. The
+                                     in-app prompt links to System Settings
+                                     and tells you which lists to tick. If
+                                     hotkeys silently don't fire when MacroFlow
+                                     is in the background on macOS 15, you're
+                                     missing Input Monitoring.
+                                     macOS routes events to LOCAL or GLOBAL
+                                     monitor based on focus, never both —
+                                     no double-fire.
 
 STATUS INDICATORS
 -----------------
@@ -283,7 +356,12 @@ App-level undo stack (max 50 entries) covers:
   • Settings → Reset to Defaults (font sizes)
   • Top-bar → Recall preset (full prior grid state)
   • Top-bar → Delete preset (preset is restored)
-  • Editor → Clear cell (cleared macro is re-saved)
+  • Editor → Clear Macro (cleared macro is re-saved)
+  • Cmd+V Paste Macro (previous occupant restored)
+
+Settings → Reset All is INTENTIONALLY NOT undoable — it's a destructive
+"factory reset" with a confirmation dialog. Export Settings first if you
+want a recovery path.
 
 NSText fields handle their own edit-undo before our Cmd+Z. Within-editor
 transient edits (Reset Selected / Reset All Tracks, drag-scrub) are not
@@ -361,6 +439,7 @@ JSON shape (top-level + per-macro keys, all current):
      "keep_on_top": false,
      "global_hotkeys": false,
      "font_sizes": {{"display": 12, "title": 13, "hotkey": 26}},
+     "timeline_resolution": "auto",
      "presets": {{ "Preset 1": {{"rows":4, "cols":4, "macros":{{...}}}} }},
      "macros": {{
        "0,0": {{
@@ -381,6 +460,30 @@ Track binding: `track_names` records the Resolve track name at SAVE
 time. On load, MacroFlow prefers a name match over an idx match — so
 inserting / deleting Resolve tracks (which shifts indices) leaves your
 saved transforms attached to the correct physical track.
+
+Multi-user: every user on this Mac reads + writes the SAME config file
+(/Users/Shared/MacroFlow/macroflow.json). Edit on one account, log into
+another → same macros, same settings, same presets. The same applies
+to Videohub Controller's config at /Users/Shared/Videohub Controller/.
+
+EXPORT / IMPORT / RESET ALL
+---------------------------
+File > Export Settings…   (Cmd+Shift+E)
+   Writes a verbatim copy of macroflow.json to a path you pick. Picks
+   up everything: every macro in every cell, every preset, font sizes,
+   grid size, Videohub state, Keep on Top, Global Hotkeys, Timeline
+   resolution override.
+
+File > Import Settings…   (Cmd+Shift+I)
+   Atomic-writes the chosen .json over /Users/Shared/MacroFlow/
+   macroflow.json, then reloads in place — no restart needed.
+
+Settings > Reset All
+   Wipes every macro + every setting back to defaults (4×4 grid,
+   default fonts, no presets, no hotkeys, Videohub on, Auto-detect
+   timeline). Confirmation dialog asks first; NO undo. The recommended
+   workflow: Export Settings… first, then Reset All. If you regret
+   the reset, Import Settings… restores everything byte-for-byte.
 
 UI COLOR PALETTE  (matches Videohub Controller)
 -----------------------------------------------
@@ -406,10 +509,13 @@ Computed offsets per quadrant (timeline-derived):
    Q3 bottom-left   = (-tl_w/2, -tl_h/2)
    Q4 bottom-right  = (+tl_w/2, -tl_h/2)
 
-For a 4K timeline (3840 × 2160) those become (±1920, ±1080). The editor
-reads timeline_w / timeline_h via `tl.GetSetting()` at editor-open time
-and on cell navigation, so changing project resolution mid-session is
-picked up automatically.
+For a 4K timeline (3840 × 2160) those become (±1920, ±1080); for an
+8K timeline (7680 × 4320) they become (±3840, ±2160). The editor reads
+timeline_w / timeline_h via `tl.GetSetting()` at editor-open time and
+on cell navigation. If Resolve's API returns wrong (compound clips /
+nested timelines on macOS 15 sometimes return 1920×1080 for an 8K
+timeline), pin the value in the editor's Timeline dropdown or in
+Settings → Timeline.
 
 KEYBOARD QUICK REFERENCE
 ------------------------
@@ -426,6 +532,8 @@ Main grid window
   Cmd+Shift+C          Show Console.
   Cmd+Shift+E          Export Settings…
   Cmd+Shift+I          Import Settings…
+  Cmd+C  /  Cmd+V      Copy macro / paste onto selected cell. Inside a
+                       text field, Cmd+C/V works as standard text edit.
   Letter / digit / Fn  Fire the matching macro hotkey.
 
 Macro editor

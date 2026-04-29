@@ -72,15 +72,30 @@ class _MacroCellButton(NSButton):
 
     Default NSButton behavior fires the action only on left-mouse-down. We
     want right-click to open the macro editor for that cell, so we override
-    rightMouseDown_ and call back to the AppController via a known method.
+    rightMouseDown_ and call back to the AppController.
+
+    macOS routes Ctrl+click as BOTH mouseDown (with the Control modifier)
+    AND rightMouseDown — if both fired the editor-open path, opening the
+    editor twice in quick succession crashed the app. We sidestep that
+    here by ignoring Ctrl-modified rightMouseDown_ events so Ctrl+click
+    flows ONLY through the regular cellClicked_ path on the controller.
+    Plain right-click (no Control modifier) still works as before.
     """
 
     def rightMouseDown_(self, event):  # noqa: N802 (Cocoa accessor)
+        try:
+            from AppKit import NSEventModifierFlagControl as _ctrl
+            if int(event.modifierFlags()) & int(_ctrl):
+                # Ctrl+click — let cellClicked_ handle it. Don't call super
+                # either; super on rightMouseDown_ for an NSButton is a
+                # no-op for our purposes.
+                return
+        except Exception:
+            pass
         target = self.target()
         if target is not None and hasattr(target, "cellRightClicked_"):
             target.cellRightClicked_(self)
         else:
-            # Fall back to default behavior so we don't swallow the event.
             super().rightMouseDown_(event)
 
 # Glyphs displayed on the cell in front of the hotkey letter when the macro
@@ -656,12 +671,16 @@ class AppController(NSObject):
         from AppKit import NSAlert, NSAlertFirstButtonReturn, NSAppearance
         import subprocess
         alert = NSAlert.alloc().init()
-        alert.setMessageText_("Accessibility Permission Required")
+        alert.setMessageText_("Accessibility + Input Monitoring Required")
         alert.setInformativeText_(
-            "Global Hotkeys need Accessibility permission to capture "
-            "keystrokes when MacroFlow is in the background.\n\n"
-            "Click Open Settings, enable MacroFlow in the Accessibility "
-            "list, then re-tick Global Hotkeys.",
+            "Global Hotkeys need both Accessibility AND Input Monitoring "
+            "permission to capture keystrokes when MacroFlow is in the "
+            "background.\n\n"
+            "macOS 15+ moved keyboard capture from Accessibility into a "
+            "new Input Monitoring bucket — without the latter, Global "
+            "Hotkeys silently fail.\n\n"
+            "Click Open Settings, enable MacroFlow in BOTH lists, then "
+            "re-tick Global Hotkeys.",
         )
         alert.addButtonWithTitle_("Open Settings")
         alert.addButtonWithTitle_("Not Now")
@@ -1474,7 +1493,11 @@ class AppController(NSObject):
 
     def cellClicked_(self, sender) -> None:  # NOQA: N802
         row, col = self._row_col_from_tag(int(sender.tag()))
-        # Cmd-click or Control-click opens the editor; plain click fires.
+        # Cmd-click OR Ctrl-click opens the editor; plain click fires.
+        # Ctrl+click on macOS does NOT trigger rightMouseDown_ on an
+        # NSButton subclass — it sends a regular mouseDown_ with the
+        # Control modifier flag — so we have to handle both modifiers
+        # here. Duplicate-open suppression lives in _open_editor.
         flags = 0
         evt = NSApp.currentEvent()
         if evt is not None:
@@ -1485,7 +1508,8 @@ class AppController(NSObject):
             self._fire(row, col)
 
     def cellRightClicked_(self, sender) -> None:  # NOQA: N802
-        # Right-click opens the editor for that cell (alongside Cmd+/Ctrl+click).
+        # Right-click (and Ctrl+click, which macOS treats as right-click)
+        # opens the editor for that cell.
         row, col = self._row_col_from_tag(int(sender.tag()))
         # Mark it as the "selected" cell so Edit > Edit Macro targets it too.
         self._flash_cell(row, col)
@@ -1501,6 +1525,94 @@ class AppController(NSObject):
         r, c = sel
         if r < self._store.grid.rows and c < self._store.grid.cols:
             self._open_editor(r, c)
+
+    # ── Macro copy / paste ─────────────────────────────────────────────
+    # Cmd+C in the Edit menu calls _AppDelegate.copy_, which routes here.
+    # The clipboard is in-process — closing MacroFlow drops it.
+    @objc.python_method
+    def _has_selected_macro(self) -> bool:
+        sel = getattr(self, "_selected_fire_key", None)
+        if sel is None:
+            return False
+        r, c = sel
+        return self._store.grid.get(r, c) is not None
+
+    @objc.python_method
+    def _has_macro_clipboard(self) -> bool:
+        return getattr(self, "_macro_clipboard", None) is not None
+
+    @objc.python_method
+    def copy_selected_macro(self) -> None:
+        sel = getattr(self, "_selected_fire_key", None)
+        if sel is None:
+            self._lcd.setStringValue_("Copy: no cell selected")
+            return
+        r, c = sel
+        macro = self._store.grid.get(r, c)
+        if macro is None:
+            self._lcd.setStringValue_(f"Copy: R{r+1}C{c+1} is empty")
+            return
+        # Snapshot via to_dict so the clipboard is plain data — pasting
+        # later won't share mutable references with the source macro.
+        self._macro_clipboard = macro.to_dict()
+        label = macro.label or macro.id
+        self._lcd.setStringValue_(f"Copied: {label}")
+
+    @objc.python_method
+    def paste_to_selected_macro(self) -> None:
+        clip = getattr(self, "_macro_clipboard", None)
+        if clip is None:
+            self._lcd.setStringValue_("Paste: clipboard is empty")
+            return
+        sel = getattr(self, "_selected_fire_key", None)
+        if sel is None:
+            self._lcd.setStringValue_("Paste: no cell selected")
+            return
+        r, c = sel
+        if r >= self._store.grid.rows or c >= self._store.grid.cols:
+            return
+        # Snapshot the existing macro so undo can restore it.
+        prev = self._store.grid.get(r, c)
+        prev_dict = prev.to_dict() if prev is not None else None
+        new_macro = Macro.from_dict(dict(clip))
+        self._store.grid.set(r, c, new_macro)
+        try:
+            self._store.save()
+        except Exception as e:
+            print(f"[paste] save failed: {e}")
+        self._refresh_cell_titles()
+
+        # Wire undo so a paste isn't a one-way street.
+        target_dict = new_macro.to_dict()
+
+        def _undo():
+            if prev_dict is None:
+                self._store.grid.clear(r, c)
+            else:
+                self._store.grid.set(r, c, Macro.from_dict(prev_dict))
+            try:
+                self._store.save()
+            except Exception:
+                pass
+            self._refresh_cell_titles()
+
+        def _redo():
+            self._store.grid.set(r, c, Macro.from_dict(target_dict))
+            try:
+                self._store.save()
+            except Exception:
+                pass
+            self._refresh_cell_titles()
+
+        try:
+            self.push_undo(
+                f"paste macro into R{r+1}C{c+1}", _undo, _redo,
+            )
+        except Exception:
+            pass
+
+        label = new_macro.label or new_macro.id
+        self._lcd.setStringValue_(f"Pasted: {label} → R{r+1}C{c+1}")
 
     @objc.python_method
     def _fire(self, row: int, col: int) -> None:
@@ -1628,13 +1740,52 @@ class AppController(NSObject):
 
     @objc.python_method
     def _open_editor(self, row: int, col: int) -> None:
-        editor = MacroEditorWindow.alloc().initWithController_row_col_(
-            self, row, col,
-        )
-        editor.makeKeyAndOrderFront_(None)
-        if not hasattr(self, "_editors"):
-            self._editors = []
-        self._editors.append(editor)
+        # Single-instance editor: at most one MacroEditorWindow exists at a
+        # time. If one is open, close it before opening the new cell's
+        # editor — the editor isn't designed to retarget cells in place,
+        # so close-and-reopen is the cleanest semantic.
+        import time
+        import traceback
+        now = time.monotonic()
+        last_key, last_t = getattr(self, "_last_editor_open", (None, 0.0))
+        if last_key == (row, col) and (now - last_t) < 0.4:
+            return
+        self._last_editor_open = ((row, col), now)
+
+        existing = getattr(self, "_editor", None)
+        if existing is not None:
+            try:
+                if existing.isVisible():
+                    # If the user re-invokes for the SAME cell, just bring
+                    # the existing editor forward — don't disturb their work.
+                    er = int(getattr(existing, "_row", -1))
+                    ec = int(getattr(existing, "_col", -1))
+                    if er == int(row) and ec == int(col):
+                        existing.makeKeyAndOrderFront_(None)
+                        return
+                existing.close()
+            except Exception:
+                pass
+            self._editor = None
+
+        try:
+            editor = MacroEditorWindow.alloc().initWithController_row_col_(
+                self, row, col,
+            )
+        except Exception as e:
+            print(f"[editor] init raised: {e!r}")
+            traceback.print_exc()
+            return
+        if editor is None:
+            print("[editor] init returned None")
+            return
+        try:
+            editor.makeKeyAndOrderFront_(None)
+        except Exception as e:
+            print(f"[editor] makeKeyAndOrderFront_ raised: {e!r}")
+            traceback.print_exc()
+            return
+        self._editor = editor
 
     @objc.python_method
     def _export_settings(self) -> None:
@@ -1706,6 +1857,34 @@ class _AppDelegate(NSObject):
         # Don't quit when an editor (or settings/about) is closed while
         # the main window happens to be hidden. The user quits via Cmd+Q.
         return False
+
+    # ── Copy / Paste of macros via the standard Edit menu ──────────────
+    # Cmd+C / Cmd+V land here only when no NSText* first responder claims
+    # them — i.e., when the user has clicked a cell rather than focused a
+    # text field. Standard text-edit Cut/Copy/Paste in fields keeps
+    # working because the responder chain checks fields first.
+    def copy_(self, sender):  # NOQA: N802
+        if _APP_CONTROLLER is not None:
+            _APP_CONTROLLER.copy_selected_macro()
+
+    def paste_(self, sender):  # NOQA: N802
+        if _APP_CONTROLLER is not None:
+            _APP_CONTROLLER.paste_to_selected_macro()
+
+    def validateMenuItem_(self, item):  # NOQA: N802
+        # Grey out Copy when no cell is selected, and Paste when the
+        # macro clipboard is empty. Other menu items default to enabled.
+        try:
+            sel = str(item.action())
+        except Exception:
+            return True
+        if _APP_CONTROLLER is None:
+            return True
+        if sel == "copy:":
+            return _APP_CONTROLLER._has_selected_macro()
+        if sel == "paste:":
+            return _APP_CONTROLLER._has_macro_clipboard()
+        return True
 
     def applicationWillTerminate_(self, notif):  # NOQA: N802
         # On Cmd+Q / menu Quit, restore the DaVinci Resolve project to the

@@ -36,6 +36,15 @@ _BRIGHT_LABEL = NSColor.whiteColor()
 _LABEL_FONT = NSFont.systemFontOfSize_(13)
 _NAME_FONT = NSFont.boldSystemFontOfSize_(15)
 
+# Quadrant labels are constant — cache the NSString instances so drawRect_
+# doesn't allocate four fresh NSString objects per frame.
+_Q_LABELS = {
+    "Q1": NSString.stringWithString_("Q1"),
+    "Q2": NSString.stringWithString_("Q2"),
+    "Q3": NSString.stringWithString_("Q3"),
+    "Q4": NSString.stringWithString_("Q4"),
+}
+
 
 class QuadPreviewView(NSView):
     """Draws a 16:9 quad-view monitor showing which quadrant is active.
@@ -48,10 +57,24 @@ class QuadPreviewView(NSView):
     def init(self):
         self = objc.super(QuadPreviewView, self).init()
         if self is not None:
-            self._active_quad: str | None = None  # "Q1".."Q4" or None
-            self._track_name: str = ""
-            self._click_handler = None
+            self._init_defaults()
         return self
+
+    def initWithFrame_(self, frame):  # NOQA: N802 (Cocoa accessor)
+        # The editor allocates this view via initWithFrame_, which bypasses
+        # init(). Without this override our instance attrs never get set
+        # and the first drawRect_ raises AttributeError, which Cocoa
+        # propagates as an ObjC exception that crashes the whole app.
+        self = objc.super(QuadPreviewView, self).initWithFrame_(frame)
+        if self is not None:
+            self._init_defaults()
+        return self
+
+    @objc.python_method
+    def _init_defaults(self) -> None:
+        self._active_quad: str | None = None  # "Q1".."Q4" or None
+        self._track_name: str = ""
+        self._click_handler = None
 
     def set_active(self, quad_str: str | None, track_name: str = "") -> None:
         self._active_quad = quad_str
@@ -79,6 +102,24 @@ class QuadPreviewView(NSView):
             pass
 
     def drawRect_(self, rect):  # NOQA: N802 (Cocoa accessor)
+        # Hard guard: Cocoa propagates Python exceptions raised in
+        # drawRect_ back through PyObjCErr_ToObjCWithGILState, which
+        # crashes the entire app. Wrap the whole body so a draw-time
+        # error logs and skips a frame instead of taking the app down.
+        try:
+            self._draw_quad_preview(rect)
+        except Exception as e:
+            print(f"[quad_preview] drawRect_ error: {e!r}")
+
+    @objc.python_method
+    def _draw_quad_preview(self, rect):
+        # Editor allocates this view via initWithFrame_, which bypasses our
+        # custom init() — so the instance attrs may not exist on first draw.
+        # Read them defensively rather than raising AttributeError into
+        # Cocoa's draw chain (which crashes the app on macOS 15).
+        active_quad = getattr(self, "_active_quad", None)
+        track_name = getattr(self, "_track_name", "") or ""
+
         frame = self.bounds()
         fw, fh = float(frame.size.width), float(frame.size.height)
 
@@ -108,9 +149,9 @@ class QuadPreviewView(NSView):
             "Q4": NSMakeRect(ox + half_w, oy, half_w, half_h),
         }
 
-        if self._active_quad in quads:
+        if active_quad in quads:
             _HIGHLIGHT_BLUE.set()
-            NSBezierPath.bezierPathWithRect_(quads[self._active_quad]).fill()
+            NSBezierPath.bezierPathWithRect_(quads[active_quad]).fill()
 
         _GRID_LINE.set()
         vline = NSBezierPath.bezierPath()
@@ -130,7 +171,7 @@ class QuadPreviewView(NSView):
         border.stroke()
 
         for q_name, q_rect in quads.items():
-            is_active = (q_name == self._active_quad)
+            is_active = (q_name == active_quad)
             qx = float(q_rect.origin.x)
             qy = float(q_rect.origin.y)
             qw = float(q_rect.size.width)
@@ -142,18 +183,18 @@ class QuadPreviewView(NSView):
                     _BRIGHT_LABEL if is_active else _DIM_LABEL
                 ),
             }
-            label_str = NSString.stringWithString_(q_name)
+            label_str = _Q_LABELS.get(q_name) or NSString.stringWithString_(q_name)
             label_size = label_str.sizeWithAttributes_(attrs)
             lx = qx + (qw - float(label_size.width)) / 2.0
             ly = qy + qh / 2.0 + 6
             label_str.drawAtPoint_withAttributes_((lx, ly), attrs)
 
-            if is_active and self._track_name:
+            if is_active and track_name:
                 name_attrs = {
                     NSFontAttributeName: _NAME_FONT,
                     NSForegroundColorAttributeName: _BRIGHT_LABEL,
                 }
-                name_str = NSString.stringWithString_(self._track_name)
+                name_str = NSString.stringWithString_(track_name)
                 name_size = name_str.sizeWithAttributes_(name_attrs)
                 nx = qx + (qw - float(name_size.width)) / 2.0
                 ny = qy + (ly - qy) / 2.0 - float(name_size.height) / 2.0
